@@ -129,9 +129,9 @@ jobs:
             curl https://sh.rustup.rs -sSf | sh -s -- -y
             . "$HOME/.cargo/env"
 
-            # If Leptos needs wasm target / trunk, uncomment these:
-            # rustup target add wasm32-unknown-unknown
-            # cargo install --locked trunk
+            # Install wasm target + trunk for Leptos
+            rustup target add wasm32-unknown-unknown
+            cargo install --locked trunk
 
             # Tauri CLI (needed for `cargo tauri build`)
             cargo install --locked tauri-cli
