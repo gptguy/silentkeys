@@ -1,0 +1,173 @@
+name: 'publish'
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust_targets: 'aarch64-apple-darwin'
+            label: 'macos-arm64'
+
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            rust_targets: 'x86_64-apple-darwin'
+            label: 'macos-intel'
+
+          - platform: windows-latest
+            args: ''
+            rust_targets: ''
+            label: 'windows-x64'
+
+          - platform: ubuntu-22.04
+            args: ''
+            rust_targets: ''
+            label: 'linux-x64'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: build and publish (all desktop targets)
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'App v__VERSION__'
+          releaseBody: 'See the assets to download this version and install.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  publish-linux-arm:
+    needs: publish-desktop
+    runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        arch: [aarch64, armv7l]
+        include:
+          - arch: aarch64
+            cpu: cortex-a72
+            base_image: https://dietpi.com/downloads/images/DietPi_RPi5-ARMv8-Bookworm.img.xz
+            deb: arm64
+            rpm: aarch64
+            appimage: aarch64
+          - arch: armv7l
+            cpu: cortex-a53
+            deb: armhfp
+            rpm: arm
+            appimage: armhf
+            base_image: https://dietpi.com/downloads/images/DietPi_RPi-ARMv7-Bookworm.img.xz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Build app (Linux ARM in QEMU)
+        uses: pguyot/arm-runner-action@v2.6.5
+        with:
+          base_image: ${{ matrix.base_image }}
+          cpu: ${{ matrix.cpu }}
+          bind_mount_repository: true
+          image_additional_mb: 10240
+          optimize_image: no
+          commands: |
+            # Prevent Rust from complaining about $HOME not matching eid home
+            export HOME=/root
+
+            # Workaround to CI worker being stuck on Updating crates.io index
+            export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+            # Install system deps needed by Tauri on Linux
+            apt-get update -y --allow-releaseinfo-change
+            apt-get autoremove -y
+            apt-get install -y --no-install-recommends --no-install-suggests \
+              curl libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev \
+              libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2 file
+
+            # Install Rust
+            curl https://sh.rustup.rs -sSf | sh -s -- -y
+            . "$HOME/.cargo/env"
+
+            # If Leptos needs wasm target / trunk, uncomment these:
+            # rustup target add wasm32-unknown-unknown
+            # cargo install --locked trunk
+
+            # Tauri CLI (needed for `cargo tauri build`)
+            cargo install --locked tauri-cli
+
+            # Build the application (Leptos + Tauri, pure Rust)
+            cargo tauri build -- --verbose
+
+      - name: Get app version
+        run: echo "APP_VERSION=$(jq -r .version src-tauri/tauri.conf.json)" >> $GITHUB_ENV
+
+      - name: Upload deb bundle (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Debian Bundle - ${{ matrix.arch }}
+          path: ${{ github.workspace }}/src-tauri/target/release/bundle/deb/silentkeys_${{ env.APP_VERSION }}_${{ matrix.deb }}.deb
+
+      - name: Upload rpm bundle (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: RPM Bundle - ${{ matrix.arch }}
+          path: ${{ github.workspace }}/src-tauri/target/release/bundle/rpm/silentkeys-${{ env.APP_VERSION }}-1.${{ matrix.rpm }}.rpm
+
+      - name: Upload appimage bundle (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppImage Bundle - ${{ matrix.arch }}
+          path: ${{ github.workspace }}/src-tauri/target/release/bundle/appimage/silentkeys_${{ env.APP_VERSION }}_${{ matrix.appimage }}.AppImage
+
+      - name: Upload ARM bundles to GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: app-v${{ env.APP_VERSION }}
+          draft: true
+          files: |
+            src-tauri/target/release/bundle/deb/silentkeys_${{ env.APP_VERSION }}_${{ matrix.deb }}.deb
+            src-tauri/target/release/bundle/rpm/silentkeys-${{ env.APP_VERSION }}-1.${{ matrix.rpm }}.rpm
+            src-tauri/target/release/bundle/appimage/silentkeys_${{ env.APP_VERSION }}_${{ matrix.appimage }}.AppImage
