@@ -55,7 +55,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
-
+          
+      - name: Install wasm target + trunk
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install --locked trunk
+          
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -136,7 +141,7 @@ jobs:
             # Tauri CLI (needed for `cargo tauri build`)
             cargo install --locked tauri-cli
 
-            # Build the application (Leptos + Tauri, pure Rust)
+            # Build the application
             cargo tauri build -- --verbose
 
       - name: Get app version
