@@ -49,8 +49,8 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            speech_threshold: 0.5,
-            min_speech_ms: 150,
+            speech_threshold: 0.3,
+            min_speech_ms: 100,
             min_silence_ms: 300,
             max_phrase_sec: 15.0,
         }
@@ -118,6 +118,7 @@ impl StreamingTranscriber {
 
             match self.vad.process_chunk(&self.chunk_buffer) {
                 Ok(prob) => {
+                    log::debug!("VAD probability: {:.3}, state: {}", prob, self.state());
                     if let Some(event) = self.update_state_with_chunk(prob) {
                         events.push(event);
                     }
@@ -218,6 +219,7 @@ impl StreamingTranscriber {
 
     pub fn flush(&mut self) -> Option<Vec<f32>> {
         if self.phrase_buffer.is_empty() {
+            log::warn!("Flush: phrase_buffer is empty (VAD never detected speech)");
             self.reset_state();
             return None;
         }
@@ -232,7 +234,15 @@ impl StreamingTranscriber {
                 let buffer = self.take_phrase_buffer();
                 self.reset_state();
                 return Some(buffer);
+            } else {
+                log::warn!(
+                    "Flush: speech too short ({}ms < {}ms required)",
+                    speech_ms,
+                    self.config.min_speech_ms
+                );
             }
+        } else {
+            log::warn!("Flush: speech_start is None (VAD detected speech but state was reset?)");
         }
 
         log::debug!("Flush: discarding insufficient audio");

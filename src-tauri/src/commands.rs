@@ -89,9 +89,8 @@ pub fn start_recording(app: AppHandle) -> Result<(), String> {
             crate::streaming::run_streaming(model, |samples| {
                 let state = app_handle.state::<SpeechEngine>();
                 if let Ok(text) = state.transcribe_samples(samples) {
-                    if Recorder::global().is_recording() {
-                        let _ = app_handle.emit("transcription_update", text);
-                    }
+                    log::info!("UI streaming: emitting transcription (len={})", text.len());
+                    let _ = app_handle.emit("transcription_update", text);
                 }
             });
         });
@@ -108,7 +107,10 @@ pub fn stop_recording(app: AppHandle, state: State<'_, SpeechEngine>) -> Result<
 
     let streaming = crate::settings::get_settings(&app).streaming_enabled;
     if streaming {
-        log::info!("Streaming mode: {} samples remaining", samples.len());
+        log::info!(
+            "Streaming mode: {} samples remaining (drained during recording)",
+            samples.len()
+        );
         return Ok(String::new());
     }
 

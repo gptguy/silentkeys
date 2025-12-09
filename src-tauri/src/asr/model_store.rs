@@ -22,6 +22,7 @@ const MODEL_FILES: &[&str] = &[
     "decoder_joint-model.int8.onnx",
     "encoder-model.onnx",
     "decoder_joint-model.onnx",
+    "nemo128.onnx",
     "vocab.txt",
 ];
 
