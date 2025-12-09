@@ -38,6 +38,8 @@ pub fn run() {
             commands::update_record_shortcut,
             commands::get_record_shortcut,
             commands::default_record_shortcut,
+            commands::get_use_streaming,
+            commands::set_use_streaming,
             commands::reset_settings
         ])
         .build(context)
@@ -55,6 +57,7 @@ fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
     if let RunEvent::Reopen {
         has_visible_windows,
@@ -69,6 +72,9 @@ fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
         }
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn handle_run_event(_app_handle: &AppHandle, _event: RunEvent) {}
 
 fn on_second_instance(app: &AppHandle, argv: Vec<String>, cwd: String) {
     log::info!("{}, {argv:?}, {cwd}", app.package_info().name);
@@ -89,7 +95,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(desktop)]
 fn prewarm_model(app_handle: AppHandle) {
-    // Pre-warm the Parakeet ASR model in the background so the first transcription is fast.
     async_runtime::spawn_blocking(move || {
         let start = Instant::now();
         let state = app_handle.state::<SpeechEngine>();

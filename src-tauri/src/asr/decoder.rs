@@ -64,13 +64,13 @@ impl DecoderWorkspace {
         })
     }
 
+    #[inline]
     pub(crate) fn reset_state(&mut self) {
         self.state.0.fill(0.0);
         self.state.1.fill(0.0);
     }
 
     pub(crate) fn set_encoder_step(&mut self, frame: &ArrayView1<f32>) {
-        // encoder_step shape: [1, feature_dim, 1]
         let mut view = self.encoder_step.index_axis_mut(ndarray::Axis(2), 0);
         let mut view = view.index_axis_mut(ndarray::Axis(0), 0);
         view.assign(frame);
@@ -84,14 +84,13 @@ impl DecoderWorkspace {
 impl AsrModel {
     pub(crate) fn decode_sequence(
         &mut self,
-        encodings: &ArrayViewD<f32>, // [time_steps, 1024]
+        encodings: &ArrayViewD<f32>,
         encodings_len: usize,
     ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
         let decode_start = Instant::now();
         let mut tokens = Vec::with_capacity(encodings_len / 2 + 4);
         let mut timestamps = Vec::with_capacity(encodings_len / 2 + 4);
 
-        // Reuse decoder workspace to avoid per-step allocations.
         let workspace = &mut self.decoder_workspace;
         workspace.reset_state();
 
@@ -120,12 +119,8 @@ impl AsrModel {
                 .ok_or_else(|| AsrError::OutputNotFound("outputs".to_string()))?
                 .try_extract_array()?;
 
-            // Squeeze outputs like Python (remove batch dimension)
             let logits = logits.remove_axis(ndarray::Axis(0));
 
-            // For TDT models, split output into vocab logits and duration logits
-            // output[:vocab_size] = vocabulary logits
-            // output[vocab_size:] = duration logits
             let vocab_logits_slice: &[f32] = logits.as_slice().ok_or_else(|| {
                 AsrError::Shape(ndarray::ShapeError::from_kind(
                     ndarray::ErrorKind::IncompatibleShape,
@@ -133,7 +128,6 @@ impl AsrModel {
             })?;
 
             let vocab_logits = if logits.len() > self.vocab_size {
-                // TDT model - extract only vocabulary logits
                 log::trace!(
                     "TDT model detected: splitting {} logits into vocab({}) + duration",
                     logits.len(),
@@ -141,11 +135,9 @@ impl AsrModel {
                 );
                 &vocab_logits_slice[..self.vocab_size]
             } else {
-                // Regular RNN-T model
                 vocab_logits_slice
             };
 
-            // Get argmax token from vocabulary logits only
             let token = vocab_logits
                 .iter()
                 .enumerate()
@@ -157,25 +149,25 @@ impl AsrModel {
                 let state1 = outputs
                     .get("output_states_1")
                     .ok_or_else(|| AsrError::OutputNotFound("output_states_1".to_string()))?
-                    .try_extract_array()?;
+                    .try_extract_array::<f32>()?;
                 let state2 = outputs
                     .get("output_states_2")
                     .ok_or_else(|| AsrError::OutputNotFound("output_states_2".to_string()))?
-                    .try_extract_array()?;
+                    .try_extract_array::<f32>()?;
 
-                let state1_3d = state1.to_owned().into_dimensionality::<ndarray::Ix3>()?;
-                let state2_3d = state2.to_owned().into_dimensionality::<ndarray::Ix3>()?;
-
-                // Reuse buffers when shapes match; otherwise replace.
-                if workspace.state.0.shape() == state1_3d.shape() {
-                    workspace.state.0.assign(&state1_3d);
-                } else {
-                    workspace.state.0 = state1_3d;
+                if let Ok(state1_view) = state1.view().into_dimensionality::<ndarray::Ix3>() {
+                    if workspace.state.0.shape() == state1_view.shape() {
+                        workspace.state.0.assign(&state1_view);
+                    } else {
+                        workspace.state.0 = state1_view.to_owned();
+                    }
                 }
-                if workspace.state.1.shape() == state2_3d.shape() {
-                    workspace.state.1.assign(&state2_3d);
-                } else {
-                    workspace.state.1 = state2_3d;
+                if let Ok(state2_view) = state2.view().into_dimensionality::<ndarray::Ix3>() {
+                    if workspace.state.1.shape() == state2_view.shape() {
+                        workspace.state.1.assign(&state2_view);
+                    } else {
+                        workspace.state.1 = state2_view.to_owned();
+                    }
                 }
 
                 tokens.push(token);
@@ -183,7 +175,6 @@ impl AsrModel {
                 emitted_tokens += 1;
             }
 
-            // Step logic from Python - simplified since step is always -1
             if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
                 t += 1;
                 emitted_tokens = 0;
@@ -223,7 +214,7 @@ impl AsrModel {
                     }
                 })
                 .to_string(),
-            Err(_) => tokens.join(""), // Fallback if regex failed to compile
+            Err(_) => tokens.join(""),
         };
 
         let float_timestamps: Vec<f32> = timestamps

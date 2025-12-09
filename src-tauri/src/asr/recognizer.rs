@@ -10,7 +10,6 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::asr::audio_io::load_audio;
 use crate::asr::decoder::DecoderWorkspace;
 
 const THREAD_ENV: &str = "ORT_THREADS";
@@ -47,7 +46,6 @@ pub enum AsrError {
 }
 
 impl AsrError {
-    /// Returns a user-friendly error message suitable for display in the UI.
     pub fn user_message(&self) -> &'static str {
         match self {
             Self::Download(_) => {
@@ -98,6 +96,7 @@ pub struct AsrModel {
     pub(super) encoder: Session,
     pub(super) decoder_joint: Session,
     pub(super) preprocessor: Session,
+
     pub(super) vocab: Vec<String>,
     pub(super) blank_idx: i32,
     pub(super) vocab_size: usize,
@@ -154,7 +153,6 @@ impl AsrModel {
     ) -> Result<Session, AsrError> {
         let providers = vec![CPUExecutionProvider::default().build()];
 
-        // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
             let quantized_name = format!("{}.int8.onnx", model_name);
             let quantized_path = model_dir.as_ref().join(&quantized_name);
@@ -241,7 +239,7 @@ impl AsrModel {
         Ok((vocab, blank_idx))
     }
 
-    pub fn preprocess(
+    fn preprocess(
         &mut self,
         waveforms: &ArrayViewD<f32>,
         waveforms_lens: &ArrayViewD<i64>,
@@ -267,7 +265,7 @@ impl AsrModel {
         Ok((features.to_owned(), features_lens.to_owned()))
     }
 
-    pub fn encode(
+    fn encode(
         &mut self,
         audio_signal: &ArrayViewD<f32>,
         length: &ArrayViewD<i64>,
@@ -295,19 +293,17 @@ impl AsrModel {
         Ok((encoder_output.to_owned(), encoded_lengths.to_owned()))
     }
 
-    pub fn recognize_batch(
+    fn recognize_batch(
         &mut self,
         waveforms: &ArrayViewD<f32>,
         waveforms_len: &ArrayViewD<i64>,
     ) -> Result<Vec<Transcript>, AsrError> {
         let recognize_start = Instant::now();
 
-        // Preprocess and encode
         let (features, features_lens) = self.preprocess(waveforms, waveforms_len)?;
         let (encoder_out, encoder_out_lens) =
             self.encode(&features.view(), &features_lens.view())?;
 
-        // Decode for each batch item
         let mut results = Vec::new();
         for (encodings, &encodings_len) in encoder_out.outer_iter().zip(encoder_out_lens.iter()) {
             let (tokens, timestamps) =
@@ -325,32 +321,16 @@ impl AsrModel {
         Ok(results)
     }
 
-    pub fn transcribe_file(&mut self, audio_path: &Path) -> Result<Transcript, AsrError> {
-        let start = Instant::now();
-        let samples = load_audio(audio_path)?;
-        let result = self.transcribe_samples(samples)?;
-        log::info!(
-            "Transcription for {} completed in {:?}",
-            audio_path.display(),
-            start.elapsed()
-        );
-        Ok(result)
-    }
-
     pub fn transcribe_samples(&mut self, samples: Vec<f32>) -> Result<Transcript, AsrError> {
         let batch_size = 1;
         let samples_len = samples.len();
 
-        // Create waveforms array [batch_size, samples_len]
-        let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
+        let audio = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
 
-        // Create waveforms_lens array [batch_size] with the actual length
-        let waveforms_lens = Array1::from_vec(vec![samples_len as i64]).into_dyn();
+        let audio_lengths = Array1::from_vec(vec![samples_len as i64]).into_dyn();
 
-        // Run recognition to get detailed results
-        let results = self.recognize_batch(&waveforms.view(), &waveforms_lens.view())?;
+        let results = self.recognize_batch(&audio.view(), &audio_lengths.view())?;
 
-        // Extract the first (and only) result
         let timestamped_result = results.into_iter().next().ok_or_else(|| {
             AsrError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

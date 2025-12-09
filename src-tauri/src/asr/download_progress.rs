@@ -26,7 +26,7 @@ fn progress_state() -> &'static Mutex<DownloadProgress> {
     })
 }
 
-pub(crate) fn start_tracking(file_count: usize) {
+pub fn start_tracking(file_count: usize) {
     if let Ok(mut progress) = progress_state().lock() {
         progress.file_index = 0;
         progress.file_count = file_count;
@@ -37,10 +37,10 @@ pub(crate) fn start_tracking(file_count: usize) {
     }
 }
 
-pub(crate) fn set_file_index(file_index: usize) {
+pub fn set_file_index(file_index: usize) {
     if let Ok(mut progress) = progress_state().lock() {
         progress.file_index = file_index;
-        // Reset bytes for the new file
+
         progress.downloaded_bytes = 0;
         progress.total_bytes = 0;
     }
@@ -53,14 +53,14 @@ pub(crate) fn update_download_bytes(downloaded: u64, total: u64) {
     }
 }
 
-pub(crate) fn mark_finished() {
+pub fn mark_finished() {
     if let Ok(mut progress) = progress_state().lock() {
         progress.file_index = progress.file_count;
         progress.done = true;
     }
 }
 
-pub(crate) fn record_failure(error: String) {
+pub fn record_failure(error: String) {
     if let Ok(mut progress) = progress_state().lock() {
         progress.error = Some(error);
         progress.done = true;

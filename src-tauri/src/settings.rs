@@ -6,6 +6,7 @@ use tauri_plugin_store::StoreExt;
 #[derive(Serialize, Deserialize, Default)]
 pub struct Settings {
     pub model_path: Option<String>,
+    pub streaming_enabled: bool,
 }
 
 const STORE_PATH: &str = "settings.json";
@@ -16,7 +17,14 @@ pub fn get_settings(app: &AppHandle) -> Settings {
             let model_path = store
                 .get("model_path")
                 .and_then(|v| v.as_str().map(|s| s.to_string()));
-            Settings { model_path }
+            let streaming_enabled = store
+                .get("streaming_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Settings {
+                model_path,
+                streaming_enabled,
+            }
         }
         Err(e) => {
             log::warn!("Failed to load settings store: {e}");
@@ -35,6 +43,11 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String>
     } else {
         store.delete("model_path");
     }
+
+    store.set(
+        "streaming_enabled",
+        serde_json::json!(settings.streaming_enabled),
+    );
 
     store.save().map_err(|e| e.to_string())
 }

@@ -1,11 +1,13 @@
 pub mod asr;
+pub mod streaming;
+pub mod vad;
 
 mod app;
 mod commands;
 #[cfg(desktop)]
-mod desktop;
+pub mod desktop;
 mod engine;
-mod recording;
+pub mod recording;
 pub mod settings;
 
 pub use app::run;

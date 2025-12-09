@@ -1,4 +1,4 @@
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::DownloadProgress;
 #[cfg(desktop)]
@@ -27,7 +27,6 @@ pub fn get_model_path(app: AppHandle) -> String {
 pub fn set_model_path(app: AppHandle, path: String) -> Result<(), String> {
     use crate::settings::{save_settings, Settings};
 
-    // Validate path exists and is a directory
     let p = std::path::PathBuf::from(&path);
     if !p.exists() || !p.is_dir() {
         return Err("Path does not exist or is not a directory".to_string());
@@ -35,7 +34,21 @@ pub fn set_model_path(app: AppHandle, path: String) -> Result<(), String> {
 
     let settings = Settings {
         model_path: Some(path),
+        ..crate::settings::get_settings(&app)
     };
+    save_settings(&app, &settings)
+}
+
+#[tauri::command]
+pub fn get_use_streaming(app: AppHandle) -> bool {
+    crate::settings::get_settings(&app).streaming_enabled
+}
+
+#[tauri::command]
+pub fn set_use_streaming(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use crate::settings::{get_settings, save_settings};
+    let mut settings = get_settings(&app);
+    settings.streaming_enabled = enabled;
     save_settings(&app, &settings)
 }
 
@@ -57,19 +70,43 @@ pub fn retry_model_download(state: State<'_, SpeechEngine>) -> Result<(), String
 }
 
 #[tauri::command]
-pub fn start_recording() -> Result<(), String> {
+pub fn start_recording(app: AppHandle) -> Result<(), String> {
     log::info!("Tauri command start_recording invoked");
     Recorder::global()
         .start()
-        .map_err(|e| e.user_message().to_string())
+        .map_err(|e| e.user_message().to_string())?;
+
+    let streaming = crate::settings::get_settings(&app).streaming_enabled;
+    if streaming {
+        let app_handle = app.clone();
+        std::thread::spawn(move || {
+            let model = crate::asr::get_or_init_vad_model(&app_handle);
+            crate::streaming::run_streaming(model, |samples| {
+                let state = app_handle.state::<SpeechEngine>();
+                if let Ok(text) = state.transcribe_samples(samples) {
+                    if Recorder::global().is_recording() {
+                        let _ = app_handle.emit("transcription_update", text);
+                    }
+                }
+            });
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn stop_recording(state: State<'_, SpeechEngine>) -> Result<String, String> {
+pub fn stop_recording(app: AppHandle, state: State<'_, SpeechEngine>) -> Result<String, String> {
     log::info!("Tauri command stop_recording invoked");
     let samples = Recorder::global()
         .stop()
         .map_err(|e| e.user_message().to_string())?;
+
+    let streaming = crate::settings::get_settings(&app).streaming_enabled;
+    if streaming {
+        log::info!("Streaming mode: {} samples remaining", samples.len());
+        return Ok(String::new());
+    }
+
     state.transcribe_samples(samples)
 }
 
@@ -95,11 +132,9 @@ pub fn default_record_shortcut() -> String {
 pub fn reset_settings(app: AppHandle) -> Result<(), String> {
     use crate::settings::{save_settings, Settings};
 
-    // Clear custom settings to use defaults
-    let settings = Settings { model_path: None };
+    let settings = Settings::default();
     save_settings(&app, &settings)?;
 
-    // Reset shortcut to default
     #[cfg(desktop)]
     {
         let default = desktop::default_record_shortcut();

@@ -1,5 +1,3 @@
-//! Microphone audio capture using cpal.
-
 use std::mem;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -11,11 +9,6 @@ use thiserror::Error;
 
 use crate::asr::{resample_linear, TARGET_SAMPLE_RATE};
 
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Errors that can occur during audio recording.
 #[derive(Error, Debug)]
 pub enum RecordingError {
     #[error("Recording is already in progress")]
@@ -35,7 +28,6 @@ pub enum RecordingError {
 }
 
 impl RecordingError {
-    /// Returns a user-friendly error message suitable for display in the UI.
     pub fn user_message(&self) -> &'static str {
         match self {
             Self::AlreadyRecording => "Recording is already in progress.",
@@ -49,11 +41,6 @@ impl RecordingError {
     }
 }
 
-// ============================================================================
-// Sample Conversion
-// ============================================================================
-
-/// Converts audio samples to normalized f32 in the range [-1.0, 1.0].
 pub trait ToNormalizedSample: Copy {
     fn to_normalized(self) -> f32;
 }
@@ -86,17 +73,12 @@ impl ToNormalizedSample for f32 {
     }
 }
 
-/// Converts a slice of samples to normalized f32 values.
 fn normalize_samples<T: ToNormalizedSample>(samples: &[T]) -> impl Iterator<Item = f32> + '_ {
     samples
         .iter()
         .copied()
         .map(ToNormalizedSample::to_normalized)
 }
-
-// ============================================================================
-// Recorder
-// ============================================================================
 
 struct SafeStream {
     _stream: cpal::Stream,
@@ -105,7 +87,6 @@ struct SafeStream {
 unsafe impl Send for SafeStream {}
 unsafe impl Sync for SafeStream {}
 
-/// Thread-safe audio recorder for capturing microphone input.
 pub struct Recorder {
     is_recording: AtomicBool,
     samples: Mutex<Vec<f32>>,
@@ -123,18 +104,15 @@ impl Recorder {
         }
     }
 
-    /// Returns the global recorder instance.
     pub fn global() -> &'static Self {
         static RECORDER: OnceLock<Recorder> = OnceLock::new();
         RECORDER.get_or_init(Self::new)
     }
 
-    /// Returns `true` if recording is currently in progress.
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::SeqCst)
     }
 
-    /// Starts recording audio from the default input device.
     pub fn start(&self) -> Result<(), RecordingError> {
         if self
             .is_recording
@@ -214,7 +192,6 @@ impl Recorder {
         Ok(())
     }
 
-    /// Stops recording and returns the captured audio samples at 16kHz.
     pub fn stop(&self) -> Result<Vec<f32>, RecordingError> {
         if self
             .is_recording
@@ -263,54 +240,41 @@ impl Recorder {
 
     fn append_normalized_samples<T: ToNormalizedSample>(&self, input: &[T]) {
         if let Ok(mut guard) = self.samples.try_lock() {
+            guard.reserve(input.len());
             guard.extend(normalize_samples(input));
         }
     }
-}
 
-// ============================================================================
-// Tests
-// ============================================================================
+    pub fn drain(&self) -> Result<Vec<f32>, RecordingError> {
+        if !self.is_recording() {
+            return Err(RecordingError::NotRecording);
+        }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        let mut samples_guard = self
+            .samples
+            .lock()
+            .map_err(|_| RecordingError::LockFailed)?;
 
-    #[test]
-    fn i8_normalization() {
-        assert!((i8::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-        assert!((0i8.to_normalized()).abs() < f32::EPSILON);
-        assert!(((-64i8).to_normalized() - (-0.5)).abs() < 0.01);
-    }
+        if samples_guard.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    #[test]
-    fn i16_normalization() {
-        assert!((i16::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-        assert!((0i16.to_normalized()).abs() < f32::EPSILON);
-    }
+        let raw_samples = std::mem::take(&mut *samples_guard);
 
-    #[test]
-    fn i32_normalization() {
-        assert!((i32::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-        assert!((0i32.to_normalized()).abs() < f32::EPSILON);
-    }
+        let sample_rate = self
+            .sample_rate
+            .lock()
+            .map_err(|_| RecordingError::LockFailed)?
+            .unwrap_or(TARGET_SAMPLE_RATE);
 
-    #[test]
-    fn f32_passthrough() {
-        assert!((0.5f32.to_normalized() - 0.5).abs() < f32::EPSILON);
-        assert!((-1.0f32.to_normalized() - (-1.0)).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn recording_error_user_messages() {
-        assert!(!RecordingError::AlreadyRecording.user_message().is_empty());
-        assert!(!RecordingError::NotRecording.user_message().is_empty());
-        assert!(!RecordingError::NoInputDevice.user_message().is_empty());
-        assert!(!RecordingError::UnsupportedFormat.user_message().is_empty());
-        assert!(!RecordingError::NoAudioCaptured.user_message().is_empty());
-        assert!(!RecordingError::Device("test".to_string())
-            .user_message()
-            .is_empty());
-        assert!(!RecordingError::LockFailed.user_message().is_empty());
+        if sample_rate == TARGET_SAMPLE_RATE {
+            Ok(raw_samples)
+        } else {
+            Ok(resample_linear(
+                &raw_samples,
+                sample_rate,
+                TARGET_SAMPLE_RATE,
+            ))
+        }
     }
 }

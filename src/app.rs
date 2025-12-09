@@ -10,6 +10,10 @@ use wasm_bindgen::{prelude::*, JsCast};
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], catch)]
     async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], catch)]
+    async fn listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>)
+        -> Result<JsValue, JsValue>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +120,25 @@ async fn save_shortcut(shortcut: &str) -> Result<String, String> {
     value
         .as_string()
         .ok_or_else(|| "Shortcut saved, but response was empty".to_string())
+}
+
+#[derive(Serialize)]
+struct SetStreamingArgs {
+    enabled: bool,
+}
+
+async fn fetch_streaming_enabled() -> Result<bool, String> {
+    let value = invoke_no_args("get_use_streaming").await?;
+    Ok(value.as_bool().unwrap_or(false))
+}
+
+async fn save_streaming_enabled(enabled: bool) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetStreamingArgs { enabled })
+        .map_err(|err| err.to_string())?;
+    invoke("set_use_streaming", args)
+        .await
+        .map(|_| ())
+        .map_err(extract_error)
 }
 
 fn extract_error(err: JsValue) -> String {
@@ -242,7 +265,9 @@ pub fn App() -> impl IntoView {
     let (model_ready, set_model_ready) = signal(false);
     let (model_error, set_model_error) = signal::<Option<String>>(None);
     let (shortcut, set_shortcut) = signal(String::new());
+
     let (shortcut_status, set_shortcut_status) = signal(String::new());
+    let (streaming_enabled, set_streaming_enabled) = signal(false);
 
     let toggle_recording = move |_| {
         if !model_ready.get() {
@@ -270,6 +295,7 @@ pub fn App() -> impl IntoView {
         if !is_recording.get() {
             set_status.set("Starting recording...".to_string());
             set_is_recording.set(true);
+            set_transcription.set(String::new()); // Clear for new recording
             spawn_local(async move {
                 match start_recording_cmd().await {
                     Ok(_) => set_status.set("Recording... tap to stop.".to_string()),
@@ -285,12 +311,27 @@ pub fn App() -> impl IntoView {
         spawn_local(async move {
             set_status.set("Stopping recording...".to_string());
             set_transcribing.set(true);
-            set_transcription.set(String::new());
+
+            // In streaming mode, keep existing transcription; otherwise clear it
+            let is_streaming = streaming_enabled.get_untracked();
+            if !is_streaming {
+                set_transcription.set(String::new());
+            }
 
             match stop_recording_cmd().await {
                 Ok(text) => {
                     set_is_recording.set(false);
-                    set_transcription.set(text);
+                    // In streaming mode, append final text; otherwise replace
+                    if is_streaming && !text.trim().is_empty() {
+                        let current = transcription.get_untracked();
+                        if current.is_empty() {
+                            set_transcription.set(text);
+                        } else {
+                            set_transcription.set(format!("{} {}", current, text));
+                        }
+                    } else if !is_streaming {
+                        set_transcription.set(text);
+                    }
                     set_status.set("Finished.".to_string());
                 }
                 Err(err) => {
@@ -302,6 +343,29 @@ pub fn App() -> impl IntoView {
             set_transcribing.set(false);
         });
     };
+
+    // Streaming event listener - accumulates phrases
+    spawn_local(async move {
+        let callback = Closure::wrap(Box::new(move |event: JsValue| {
+            if let Ok(payload) = js_sys::Reflect::get(&event, &"payload".into()) {
+                if let Some(text) = payload.as_string() {
+                    if !text.trim().is_empty() {
+                        let current = transcription.get_untracked();
+                        if current.is_empty() {
+                            set_transcription.set(text);
+                        } else {
+                            set_transcription.set(format!("{} {}", current, text));
+                        }
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+
+        if let Err(e) = listen("transcription_update", &callback).await {
+            leptos::logging::error!("Failed to listen to transcription_update: {:?}", e);
+        }
+        callback.forget();
+    });
 
     // Check model readiness and load persisted shortcut or default on startup
     {
@@ -406,6 +470,9 @@ pub fn App() -> impl IntoView {
                         }
                         if let Ok(Some(shortcut)) = fetch_default_shortcut().await {
                             set_shortcut.set(shortcut);
+                        }
+                        if let Ok(enabled) = fetch_streaming_enabled().await {
+                            set_streaming_enabled.set(enabled);
                         }
                         set_status.set("Settings reset.".to_string());
                     }
@@ -512,8 +579,30 @@ pub fn App() -> impl IntoView {
                     <div class="settings-section">
                         <div class="settings-row">
                             <div class="settings-label">
+                                <span class="settings-title">"Streaming Mode"</span>
+                                <span class="settings-hint">"Show transcription in real-time"</span>
+                            </div>
+                            <button
+                                class="toggle"
+                                class:active=move || streaming_enabled.get()
+                                on:click=move |_| {
+                                    let new_val = !streaming_enabled.get();
+                                    set_streaming_enabled.set(new_val);
+                                    spawn_local(async move {
+                                        let _ = save_streaming_enabled(new_val).await;
+                                    });
+                                }
+                            >
+                                <div class="toggle-track">
+                                    <div class="toggle-thumb"></div>
+                                </div>
+                            </button>
+                        </div>
+                        <div class="settings-row">
+                            <div class="settings-label">
                                 <span class="settings-title">"Shortcut"</span>
                                 <span class="settings-hint">"Global hotkey to start and stop recording"</span>
+                                <p class="settings-status">{ move || shortcut_status.get() }</p>
                             </div>
                             <div class="settings-input-group">
                                 <input
@@ -527,8 +616,6 @@ pub fn App() -> impl IntoView {
                                 <button class="ghost compact" on:click=save_shortcut_action>"Save"</button>
                             </div>
                         </div>
-                        <p class="settings-status">{ move || shortcut_status.get() }</p>
-
                         <div class="settings-row">
                             <div class="settings-label">
                                 <span class="settings-title">"Model Location"</span>

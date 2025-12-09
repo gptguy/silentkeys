@@ -1,6 +1,4 @@
-//! High-level speech recognition engine facade.
-
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::Instant;
 
 use crate::asr::{
@@ -11,20 +9,20 @@ use tauri::AppHandle;
 
 #[derive(Default)]
 pub struct SpeechEngine {
-    model: Mutex<Option<AsrModel>>,
+    model: RwLock<Option<AsrModel>>,
     app_handle: Option<AppHandle>,
 }
 
 impl SpeechEngine {
     pub fn new(app_handle: AppHandle) -> Self {
         Self {
-            model: Mutex::new(None),
+            model: RwLock::new(None),
             app_handle: Some(app_handle),
         }
     }
     pub fn is_ready(&self) -> bool {
         self.model
-            .lock()
+            .read()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
     }
@@ -56,7 +54,7 @@ impl SpeechEngine {
 
         let mut guard = self
             .model
-            .lock()
+            .write()
             .map_err(|_| "The speech engine is busy. Please try again.".to_string())?;
 
         if guard.is_none() {
@@ -75,7 +73,7 @@ impl SpeechEngine {
 
         let mut guard = self
             .model
-            .lock()
+            .write()
             .map_err(|_| "The speech engine is busy. Please try again.".to_string())?;
 
         let model = guard
@@ -104,6 +102,12 @@ impl SpeechEngine {
             model_dir.display(),
             start.elapsed()
         );
+
+        if let Err(e) = crate::asr::ensure_vad_model(app_handle) {
+            log::warn!("VAD model download failed: {e}");
+        } else {
+            log::info!("VAD model ready");
+        }
 
         let load_start = Instant::now();
         let model = AsrModel::new(&model_dir, true)?;

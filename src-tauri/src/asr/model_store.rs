@@ -12,17 +12,57 @@ use tauri::AppHandle;
 const MODEL_BASE_URL: &str =
     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main";
 
+const VAD_MODEL_URL: &str =
+    "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/model.onnx";
+
+const VAD_MODEL_FILE: &str = "silero_vad_model.onnx";
+
 const MODEL_FILES: &[&str] = &[
     "encoder-model.int8.onnx",
     "decoder_joint-model.int8.onnx",
     "encoder-model.onnx",
     "decoder_joint-model.onnx",
-    "nemo128.onnx",
     "vocab.txt",
 ];
 
 const MAX_RETRIES: usize = 3;
 const RETRY_BACKOFF_SECS: u64 = 2;
+
+pub fn vad_model_path(app: &AppHandle) -> PathBuf {
+    let root = default_model_root(app);
+    root.join("snapshots")
+        .join("downloaded")
+        .join(VAD_MODEL_FILE)
+}
+
+pub fn ensure_vad_model(app: &AppHandle) -> Result<PathBuf, AsrError> {
+    let path = vad_model_path(app);
+    if path.exists() {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    start_tracking(1);
+    set_file_index(1);
+
+    log::info!("Downloading VAD model...");
+    let result = download_asset(VAD_MODEL_URL, &path);
+
+    match result {
+        Ok(()) => {
+            log::info!("VAD model downloaded to {}", path.display());
+            mark_finished();
+            Ok(path)
+        }
+        Err(e) => {
+            record_failure(e.user_message().to_string());
+            Err(e)
+        }
+    }
+}
 
 pub fn default_model_root(app: &AppHandle) -> PathBuf {
     if let Some(path) = crate::settings::get_custom_model_path(app) {
@@ -32,8 +72,6 @@ pub fn default_model_root(app: &AppHandle) -> PathBuf {
     fallback_model_root()
 }
 
-/// Returns the default model root path without checking settings.
-/// Use this for CLI tools that don't have access to Tauri's AppHandle.
 pub fn fallback_model_root() -> PathBuf {
     let base = dirs_next::cache_dir()
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -115,6 +153,12 @@ fn download_default_snapshot(root: &Path) -> Result<PathBuf, AsrError> {
 
             let url = format!("{MODEL_BASE_URL}/{file}");
             download_asset(&url, &dest)?;
+        }
+
+        let vad_dest = download_dir.join(VAD_MODEL_FILE);
+        if !vad_dest.exists() {
+            log::info!("Downloading VAD model...");
+            download_asset(VAD_MODEL_URL, &vad_dest)?;
         }
 
         let refs_dir = root.join("refs");

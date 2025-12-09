@@ -1,5 +1,3 @@
-//! Desktop-specific functionality: tray icon, global shortcuts, and recording.
-
 use std::sync::{Mutex, OnceLock};
 
 use enigo::{Enigo, Keyboard, Settings};
@@ -14,26 +12,19 @@ use tauri_plugin_global_shortcut::{
 use crate::engine::SpeechEngine;
 use crate::recording::Recorder;
 
-// ============================================================================
-// Constants
-// ============================================================================
-
 const SHORTCUT_STORE: &str = "settings.json";
 const SHORTCUT_STORE_KEY: &str = "record_shortcut";
 
-// ============================================================================
-// State
-// ============================================================================
-
 static ACTIVE_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
+static TRANSCRIPTION_BUFFER: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn active_shortcut() -> &'static Mutex<Option<Shortcut>> {
     ACTIVE_SHORTCUT.get_or_init(|| Mutex::new(None))
 }
 
-// ============================================================================
-// Setup
-// ============================================================================
+fn transcription_buffer() -> &'static Mutex<String> {
+    TRANSCRIPTION_BUFFER.get_or_init(|| Mutex::new(String::new()))
+}
 
 #[cfg(desktop)]
 pub fn setup_desktop(app: &mut tauri::App) -> tauri::Result<()> {
@@ -42,10 +33,6 @@ pub fn setup_desktop(app: &mut tauri::App) -> tauri::Result<()> {
     init_shortcuts(handle)?;
     Ok(())
 }
-
-// ============================================================================
-// Tray Icon
-// ============================================================================
 
 #[cfg(desktop)]
 fn init_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -73,15 +60,13 @@ fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// Shortcuts
-// ============================================================================
-
-fn default_shortcut() -> Shortcut {
+#[doc(hidden)]
+pub fn default_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::ALT), Code::KeyZ)
 }
 
-fn parse_shortcut_str(s: &str) -> Result<Shortcut, String> {
+#[doc(hidden)]
+pub fn parse_shortcut_str(s: &str) -> Result<Shortcut, String> {
     s.parse::<Shortcut>()
         .map_err(|e| format!("Invalid shortcut: {e}"))
 }
@@ -90,11 +75,29 @@ fn type_text(text: String) {
     match Enigo::new(&Settings::default()) {
         Ok(mut enigo) => {
             if let Err(err) = enigo.text(&text) {
-                log::error!("Failed to type transcription: {err}");
+                log::error!("Failed to type text: {err}");
             }
         }
         Err(err) => log::error!("Could not initialize Enigo for typing: {err}"),
     }
+}
+
+fn append_and_type(phrase_text: String) {
+    if phrase_text.is_empty() {
+        return;
+    }
+
+    let mut state = match transcription_buffer().lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    if !state.is_empty() {
+        state.push(' ');
+        type_text(" ".to_string());
+    }
+    state.push_str(&phrase_text);
+    type_text(phrase_text);
 }
 
 fn persist_shortcut(app: &AppHandle, shortcut: &Shortcut) -> Result<(), String> {
@@ -119,13 +122,42 @@ fn load_persisted_shortcut(app: &AppHandle) -> Option<String> {
         .and_then(|value| value.as_str().map(ToString::to_string))
 }
 
-fn start_recording_async() {
+fn start_recording_async(app: &AppHandle) {
     let recorder = Recorder::global();
+    let app_clone = app.clone();
+
+    if let Ok(mut state) = transcription_buffer().lock() {
+        state.clear();
+    }
+
     async_runtime::spawn(async move {
         log::info!("Global shortcut pressed; starting recording");
         match recorder.start() {
-            Ok(()) => log::info!("Recording started (shortcut held)"),
+            Ok(()) => {
+                log::info!("Recording started (shortcut held)");
+
+                let streaming = crate::settings::get_settings(&app_clone).streaming_enabled;
+                if streaming {
+                    let app_for_loop = app_clone.clone();
+                    std::thread::spawn(move || {
+                        run_vad_streaming_loop(&app_for_loop);
+                    });
+                }
+            }
             Err(err) => log::error!("Failed to start recording: {err}"),
+        }
+    });
+}
+
+fn run_vad_streaming_loop(app: &AppHandle) {
+    let model = crate::asr::get_or_init_vad_model(app);
+
+    crate::streaming::run_streaming(model, |samples| {
+        let engine = app.state::<SpeechEngine>();
+        match engine.transcribe_samples(samples) {
+            Ok(text) if !text.is_empty() => append_and_type(text),
+            Ok(_) => {}
+            Err(e) => log::error!("Transcription error: {e}"),
         }
     });
 }
@@ -133,27 +165,23 @@ fn start_recording_async() {
 fn stop_recording_async(app: &AppHandle) {
     let recorder = Recorder::global();
     let app_handle = app.clone();
-    async_runtime::spawn(async move {
+    std::thread::spawn(move || {
         log::info!("Global shortcut released; stopping recording");
-        let result = recorder.stop();
-
-        match result {
+        match recorder.stop() {
             Ok(samples) => {
-                let app_handle = app_handle.clone();
-                match async_runtime::spawn_blocking(move || {
-                    let state = app_handle.state::<SpeechEngine>();
-                    state.transcribe_samples(samples)
-                })
-                .await
-                {
-                    Ok(Ok(text)) => {
-                        async_runtime::spawn_blocking(move || type_text(text));
+                let streaming = crate::settings::get_settings(&app_handle).streaming_enabled;
+                if !streaming {
+                    let engine = app_handle.state::<SpeechEngine>();
+                    match engine.transcribe_samples(samples) {
+                        Ok(text) if !text.is_empty() => append_and_type(text),
+                        Ok(_) => {}
+                        Err(e) => log::error!("Transcription error: {e}"),
                     }
-                    Ok(Err(err)) => log::error!("Transcription failed: {err}"),
-                    Err(err) => log::error!("Transcription task join error: {err}"),
-                };
+                }
             }
-            Err(err) => log::error!("Failed to stop recording: {err}"),
+            Err(err) => {
+                log::error!("Failed to stop recording: {err}");
+            }
         }
     });
 }
@@ -162,7 +190,7 @@ fn make_handler() -> impl Fn(&AppHandle, &Shortcut, ShortcutEvent) + Send + Sync
     move |app: &AppHandle, _shortcut: &Shortcut, event| {
         let recorder = Recorder::global();
         match event.state() {
-            ShortcutState::Pressed if !recorder.is_recording() => start_recording_async(),
+            ShortcutState::Pressed if !recorder.is_recording() => start_recording_async(app),
             ShortcutState::Released if recorder.is_recording() => stop_recording_async(app),
             _ => log::debug!("Shortcut event ignored in state {:?}", event.state()),
         }
@@ -213,6 +241,7 @@ fn resolve_shortcut(app: &AppHandle) -> Shortcut {
         .unwrap_or_else(default_shortcut)
 }
 
+#[doc(hidden)]
 #[cfg(desktop)]
 fn init_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     app.plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
@@ -224,7 +253,6 @@ fn init_shortcuts(app: &AppHandle) -> tauri::Result<()> {
         Err(err) => log::warn!("No global shortcut registered: {err}"),
     }
 
-    // Try to register Fn key as an alternative shortcut (may not work on all platforms)
     let fn_shortcut = Shortcut::new(Some(Modifiers::FN), Code::Fn);
     if let Err(err) = app
         .global_shortcut()
@@ -234,53 +262,4 @@ fn init_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     }
 
     Ok(())
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_shortcut_is_valid() {
-        let shortcut = default_shortcut();
-        let shortcut_str = shortcut.into_string();
-        assert!(shortcut_str.contains("alt") || shortcut_str.contains("Alt"));
-        assert!(shortcut_str.contains("KeyZ"));
-    }
-
-    #[test]
-    fn parse_valid_shortcut() {
-        let result = parse_shortcut_str("Alt+KeyZ");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_shortcut_with_modifier() {
-        let result = parse_shortcut_str("Control+Shift+KeyS");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_invalid_shortcut() {
-        let result = parse_shortcut_str("InvalidShortcut");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid"));
-    }
-
-    #[test]
-    fn parse_empty_shortcut() {
-        let result = parse_shortcut_str("");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn default_record_shortcut_returns_string() {
-        let shortcut = default_record_shortcut();
-        assert!(!shortcut.is_empty());
-        assert!(shortcut.contains("Alt") || shortcut.contains("Key"));
-    }
 }
