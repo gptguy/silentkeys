@@ -128,9 +128,29 @@ impl Recorder {
                 .default_input_device()
                 .ok_or(RecordingError::NoInputDevice)?;
 
-            let config: cpal::SupportedStreamConfig = device
+            let default_config = device
                 .default_input_config()
                 .map_err(|e| RecordingError::Device(e.to_string()))?;
+
+            let config = device
+                .supported_input_configs()
+                .map_err(|e| RecordingError::Device(e.to_string()))?
+                .find_map(|c| {
+                    let min = c.min_sample_rate().0;
+                    let max = c.max_sample_rate().0;
+                    if min <= 16000 && max >= 16000 {
+                        Some(c.with_sample_rate(cpal::SampleRate(16000)))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "Native 16kHz not supported, falling back to default: {:?}",
+                        default_config
+                    );
+                    default_config
+                });
 
             log::info!(
                 "Recording started using Input Device: {}",

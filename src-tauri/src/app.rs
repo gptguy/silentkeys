@@ -99,8 +99,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("ONNX Runtime initialized successfully");
     }
 
-    crate::diagnostics::run_startup_checks();
-
     #[cfg(desktop)]
     {
         desktop::setup_desktop(app)?;

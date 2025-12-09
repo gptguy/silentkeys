@@ -275,7 +275,6 @@ where
 
     log::info!("VAD streaming loop started");
     let recorder = crate::recording::Recorder::global();
-    let mut last_level_log = std::time::Instant::now();
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(32));
@@ -289,17 +288,6 @@ where
 
         match recorder.drain() {
             Ok(samples) if !samples.is_empty() => {
-                if last_level_log.elapsed().as_secs() >= 1 {
-                    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-                    let rms = (sum_sq / samples.len() as f32).sqrt();
-                    let db = 20.0 * rms.log10();
-                    log::info!("Audio Level: {:.1} dB (RMS={:.4})", db, rms);
-                    if rms < 0.001 {
-                        log::warn!("Audio is near silent! Check input device.");
-                    }
-                    last_level_log = std::time::Instant::now();
-                }
-
                 log::debug!("Drained {} samples from recorder", samples.len());
                 for event in transcriber.feed_samples(&samples) {
                     match event {
