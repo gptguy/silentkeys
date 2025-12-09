@@ -194,16 +194,7 @@ SilentKeys is private by default:
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository.
-2. Create a feature branch (`git checkout -b feature/my-feature`).
-3. Commit your changes.
-4. Open a Pull Request.
-
-**Before submitting:**
-- Run `cargo fmt` and `cargo clippy`.
-- Ensure tests pass with `cargo test`.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to get started.
 
 ---
 

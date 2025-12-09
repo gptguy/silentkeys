@@ -2,10 +2,11 @@ pub mod asr;
 pub mod streaming;
 pub mod vad;
 
-mod app;
-mod commands;
+pub mod app;
 #[cfg(desktop)]
+pub mod commands;
 pub mod desktop;
+pub mod diagnostics;
 mod engine;
 pub mod recording;
 pub mod settings;

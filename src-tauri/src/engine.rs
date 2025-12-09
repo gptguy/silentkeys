@@ -83,9 +83,23 @@ impl SpeechEngine {
         let start = Instant::now();
         let result = model.transcribe_samples(samples).map_err(|err| {
             let message = err.user_message().to_string();
-            log::error!("Transcription failed: {}", err);
+            log::error!(
+                "Transcription failed with error: {}. Cause: {}",
+                message,
+                err
+            );
             message
         })?;
+
+        if result.text.trim().is_empty() {
+            log::warn!("Transcription completed but returned empty text.");
+        } else {
+            log::info!(
+                "Transcription success: '{}' ({} chars)",
+                result.text.chars().take(50).collect::<String>(),
+                result.text.len()
+            );
+        }
 
         log::info!("Transcription completed in {:?}", start.elapsed());
         Ok(result.text)

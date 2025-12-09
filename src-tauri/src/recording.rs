@@ -122,74 +122,88 @@ impl Recorder {
             return Err(RecordingError::AlreadyRecording);
         }
 
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(RecordingError::NoInputDevice)?;
+        let result = (|| {
+            let host = cpal::default_host();
+            let device = host
+                .default_input_device()
+                .ok_or(RecordingError::NoInputDevice)?;
 
-        let config: cpal::SupportedStreamConfig = device
-            .default_input_config()
-            .map_err(|e| RecordingError::Device(e.to_string()))?;
+            let config: cpal::SupportedStreamConfig = device
+                .default_input_config()
+                .map_err(|e| RecordingError::Device(e.to_string()))?;
 
-        {
-            let mut samples = self
-                .samples
-                .lock()
-                .map_err(|_| RecordingError::LockFailed)?;
-            samples.clear();
+            log::info!(
+                "Recording started using Input Device: {}",
+                device.name().unwrap_or_else(|_| "Unknown".to_string())
+            );
+            log::info!("Input Config: {:?}", config);
+
+            {
+                let mut samples = self
+                    .samples
+                    .lock()
+                    .map_err(|_| RecordingError::LockFailed)?;
+                samples.clear();
+            }
+            {
+                let mut rate = self
+                    .sample_rate
+                    .lock()
+                    .map_err(|_| RecordingError::LockFailed)?;
+                *rate = Some(config.sample_rate().0);
+            }
+
+            let err_fn = move |err: cpal::StreamError| {
+                log::error!("mic recording stream error: {err}");
+            };
+
+            let recorder = Recorder::global();
+            let stream_result = match config.sample_format() {
+                cpal::SampleFormat::I8 => device.build_input_stream(
+                    &config.clone().into(),
+                    move |data: &[i8], _: &_| recorder.append_normalized_samples(data),
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::I16 => device.build_input_stream(
+                    &config.clone().into(),
+                    move |data: &[i16], _: &_| recorder.append_normalized_samples(data),
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::I32 => device.build_input_stream(
+                    &config.clone().into(),
+                    move |data: &[i32], _: &_| recorder.append_normalized_samples(data),
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::F32 => device.build_input_stream(
+                    &config.clone().into(),
+                    move |data: &[f32], _: &_| recorder.append_normalized_samples(data),
+                    err_fn,
+                    None,
+                ),
+                _ => return Err(RecordingError::UnsupportedFormat),
+            };
+
+            let stream = stream_result.map_err(|e| RecordingError::Device(e.to_string()))?;
+            stream
+                .play()
+                .map_err(|e| RecordingError::Device(e.to_string()))?;
+
+            {
+                let mut guard = self.stream.lock().map_err(|_| RecordingError::LockFailed)?;
+                *guard = Some(SafeStream { _stream: stream });
+            }
+
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.is_recording.store(false, Ordering::SeqCst);
         }
-        {
-            let mut rate = self
-                .sample_rate
-                .lock()
-                .map_err(|_| RecordingError::LockFailed)?;
-            *rate = Some(config.sample_rate().0);
-        }
 
-        let err_fn = move |err: cpal::StreamError| {
-            log::error!("mic recording stream error: {err}");
-        };
-
-        let recorder = Recorder::global();
-        let stream_result = match config.sample_format() {
-            cpal::SampleFormat::I8 => device.build_input_stream(
-                &config.clone().into(),
-                move |data: &[i8], _: &_| recorder.append_normalized_samples(data),
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &config.clone().into(),
-                move |data: &[i16], _: &_| recorder.append_normalized_samples(data),
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I32 => device.build_input_stream(
-                &config.clone().into(),
-                move |data: &[i32], _: &_| recorder.append_normalized_samples(data),
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config.clone().into(),
-                move |data: &[f32], _: &_| recorder.append_normalized_samples(data),
-                err_fn,
-                None,
-            ),
-            _ => return Err(RecordingError::UnsupportedFormat),
-        };
-
-        let stream = stream_result.map_err(|e| RecordingError::Device(e.to_string()))?;
-        stream
-            .play()
-            .map_err(|e| RecordingError::Device(e.to_string()))?;
-
-        {
-            let mut guard = self.stream.lock().map_err(|_| RecordingError::LockFailed)?;
-            *guard = Some(SafeStream { _stream: stream });
-        }
-
-        Ok(())
+        result
     }
 
     pub fn stop(&self) -> Result<Vec<f32>, RecordingError> {
@@ -251,22 +265,28 @@ impl Recorder {
             return Err(RecordingError::NotRecording);
         }
 
-        let mut samples_guard = self
-            .samples
-            .lock()
-            .map_err(|_| RecordingError::LockFailed)?;
+        let (raw_samples, sample_rate) = {
+            let mut samples_guard = match self.samples.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Ok(Vec::new()),
+            };
 
-        if samples_guard.is_empty() {
-            return Ok(Vec::new());
-        }
+            if samples_guard.is_empty() {
+                return Ok(Vec::new());
+            }
 
-        let raw_samples = std::mem::take(&mut *samples_guard);
+            let raw = std::mem::take(&mut *samples_guard);
 
-        let sample_rate = self
-            .sample_rate
-            .lock()
-            .map_err(|_| RecordingError::LockFailed)?
-            .unwrap_or(TARGET_SAMPLE_RATE);
+            drop(samples_guard);
+
+            let sr = self
+                .sample_rate
+                .lock()
+                .map_err(|_| RecordingError::LockFailed)?
+                .unwrap_or(TARGET_SAMPLE_RATE);
+
+            (raw, sr)
+        };
 
         if sample_rate == TARGET_SAMPLE_RATE {
             Ok(raw_samples)

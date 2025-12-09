@@ -93,6 +93,14 @@ fn on_second_instance(app: &AppHandle, argv: Vec<String>, cwd: String) {
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = ort::init().with_name("silent-keys").commit() {
+        log::error!("Failed to initialize ONNX Runtime: {e}");
+    } else {
+        log::info!("ONNX Runtime initialized successfully");
+    }
+
+    crate::diagnostics::run_startup_checks();
+
     #[cfg(desktop)]
     {
         desktop::setup_desktop(app)?;
