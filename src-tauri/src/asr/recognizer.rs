@@ -23,11 +23,11 @@ pub struct Transcript {
 
 #[derive(thiserror::Error, Debug)]
 pub enum AsrError {
-    #[error("ORT error")]
+    #[error("ORT error: {0}")]
     Ort(#[from] ort::Error),
-    #[error("I/O error")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("ndarray shape error")]
+    #[error("ndarray shape error: {0}")]
     Shape(#[from] ndarray::ShapeError),
     #[error("Model input not found: {0}")]
     InputNotFound(String),
@@ -173,8 +173,13 @@ impl AsrModel {
             regular_name
         };
 
+        #[cfg(target_os = "windows")]
+        let opt_level = GraphOptimizationLevel::Level1;
+        #[cfg(not(target_os = "windows"))]
+        let opt_level = GraphOptimizationLevel::Level3;
+
         let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(opt_level)?
             .with_execution_providers(providers)?
             .with_parallel_execution(true)?;
 

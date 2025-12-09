@@ -48,6 +48,7 @@ pub fn get_use_streaming(app: AppHandle) -> bool {
 pub fn set_use_streaming(app: AppHandle, enabled: bool) -> Result<(), String> {
     use crate::settings::{get_settings, save_settings};
     let mut settings = get_settings(&app);
+    log::info!("Command set_use_streaming invoked: enabled={}", enabled);
     settings.streaming_enabled = enabled;
     save_settings(&app, &settings)
 }
@@ -77,6 +78,10 @@ pub fn start_recording(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.user_message().to_string())?;
 
     let streaming = crate::settings::get_settings(&app).streaming_enabled;
+    log::info!(
+        "Command start_recording: Streaming mode enabled? {}",
+        streaming
+    );
     if streaming {
         let app_handle = app.clone();
         std::thread::spawn(move || {

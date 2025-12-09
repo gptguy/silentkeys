@@ -435,11 +435,17 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    // Fetch initial model path
+    // Fetch initial model path and settings
     {
         spawn_local(async move {
             if let Ok(path) = fetch_model_path().await {
                 set_model_path.set(path);
+            }
+        });
+
+        spawn_local(async move {
+            if let Ok(enabled) = fetch_streaming_enabled().await {
+                set_streaming_enabled.set(enabled);
             }
         });
     }

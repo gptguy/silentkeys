@@ -1,19 +1,21 @@
 use std::sync::{Mutex, OnceLock};
 
+use crate::engine::SpeechEngine;
+use crate::recording::Recorder;
 use enigo::{Enigo, Keyboard, Settings};
 use serde_json::json;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{async_runtime, AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
 };
 
-use crate::engine::SpeechEngine;
-use crate::recording::Recorder;
-
 const SHORTCUT_STORE: &str = "settings.json";
 const SHORTCUT_STORE_KEY: &str = "record_shortcut";
+const MENU_ITEM_QUIT: &str = "quit";
+const MENU_ITEM_VIEW_LOGS: &str = "view_logs";
 
 static ACTIVE_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
 static TRANSCRIPTION_BUFFER: OnceLock<Mutex<String>> = OnceLock::new();
@@ -36,16 +38,35 @@ pub fn setup_desktop(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg(desktop)]
 fn init_tray(app: &AppHandle) -> tauri::Result<()> {
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&quit])?;
+    let quit = MenuItem::with_id(app, MENU_ITEM_QUIT, "Quit", true, None::<&str>)?;
+    let view_logs = MenuItem::with_id(
+        app,
+        MENU_ITEM_VIEW_LOGS,
+        "View Log File",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(app, &[&view_logs, &quit])?;
 
     let mut tray = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "quit" => {
+            MENU_ITEM_QUIT => {
                 log::info!("Quit menu item clicked");
                 app.exit(0);
+            }
+            MENU_ITEM_VIEW_LOGS => {
+                log::info!("View Log File menu item clicked");
+                if let Err(e) = open_log_file(app) {
+                    log::error!("Failed to open log file: {}", e);
+                    let _ = app
+                        .dialog()
+                        .message(format!("Failed to open log file: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Warning")
+                        .blocking_show();
+                }
             }
             _ => log::debug!("Unhandled menu item: {:?}", event.id),
         });
@@ -57,6 +78,53 @@ fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     }
 
     tray.build(app)?;
+    Ok(())
+}
+
+fn open_log_file(app: &AppHandle) -> Result<(), String> {
+    let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+
+    if !log_dir.exists() {
+        return Err("Log directory does not exist".to_string());
+    }
+
+    let log_file = std::fs::read_dir(&log_dir)
+        .ok()
+        .and_then(|entries| {
+            let mut logs: Vec<_> = entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("log"))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            logs.sort_by_key(|entry| {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            logs.last().map(|entry| entry.path())
+        })
+        .unwrap_or(log_dir);
+
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+
+    std::process::Command::new(cmd)
+        .arg(log_file)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -137,6 +205,7 @@ fn start_recording_async(app: &AppHandle) {
                 log::info!("Recording started (shortcut held)");
 
                 let streaming = crate::settings::get_settings(&app_clone).streaming_enabled;
+                log::info!("Global Shortcut: Streaming mode enabled? {}", streaming);
                 if streaming {
                     let app_for_loop = app_clone.clone();
                     std::thread::spawn(move || {

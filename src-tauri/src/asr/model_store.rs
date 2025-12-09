@@ -84,25 +84,42 @@ pub fn fallback_model_root() -> PathBuf {
 
 pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
     let root = root.as_ref();
+    log::info!("resolve_model_dir: checking root {}", root.display());
+
     let refs_main = root.join("refs").join("main");
 
     if refs_main.exists() {
         let commit = fs::read_to_string(&refs_main)?.trim().to_string();
-        let snap = root.join("snapshots").join(commit);
+        let snap = root.join("snapshots").join(&commit);
+        log::info!(
+            "Found refs/main: {}, checking snapshot at {}",
+            commit,
+            snap.display()
+        );
         if snap.is_dir() {
+            log::info!("Snapshot directory exists and is valid.");
             return Ok(snap);
+        } else {
+            log::warn!("Snapshot directory from refs/main does NOT exist or is not a dir.");
         }
+    } else {
+        log::info!("refs/main not found at {}", refs_main.display());
     }
 
     let snapshots = root.join("snapshots");
     if snapshots.is_dir() {
+        log::info!("Scanning snapshots dir: {}", snapshots.display());
         let mut newest: Option<(SystemTime, PathBuf)> = None;
         for entry in fs::read_dir(&snapshots)? {
             let entry = entry?;
+            let path = entry.path();
+            log::debug!("Found entry: {}", path.display());
+
             if !entry.file_type()?.is_dir() {
+                log::debug!("Skipping non-dir: {}", path.display());
                 continue;
             }
-            let path = entry.path();
+
             let modified = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -110,6 +127,11 @@ pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
 
             match &mut newest {
                 Some((ts, best)) if modified > *ts => {
+                    log::debug!(
+                        "Newer snapshot found: {} (ts={:?})",
+                        path.display(),
+                        modified
+                    );
                     *ts = modified;
                     *best = path;
                 }
@@ -119,8 +141,13 @@ pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
         }
 
         if let Some((_, path)) = newest {
+            log::info!("Selected newest snapshot: {}", path.display());
             return Ok(path);
+        } else {
+            log::warn!("No valid directories found in snapshots folder.");
         }
+    } else {
+        log::warn!("Snapshots folder does not exist at {}", snapshots.display());
     }
 
     log::info!(

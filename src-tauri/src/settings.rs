@@ -49,6 +49,11 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String>
         serde_json::json!(settings.streaming_enabled),
     );
 
+    log::info!(
+        "Saving settings: streaming_enabled={}",
+        settings.streaming_enabled
+    );
+
     store.save().map_err(|e| e.to_string())
 }
 

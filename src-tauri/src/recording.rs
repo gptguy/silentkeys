@@ -212,6 +212,7 @@ impl Recorder {
             .lock()
             .map_err(|_| RecordingError::LockFailed)?;
         let raw_samples = mem::take(&mut *samples_guard);
+        log::info!("Recorder stopped with {} raw samples", raw_samples.len());
 
         if raw_samples.is_empty() {
             return Err(RecordingError::NoAudioCaptured);

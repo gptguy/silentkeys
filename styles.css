@@ -56,7 +56,7 @@ body::after {
 
 .shell {
   width: min(900px, 100%);
-  padding: 24px 24px 64px;
+  padding: 24px 24px 36px;
   display: flex;
   flex-direction: column;
   gap: 20px;
