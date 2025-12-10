@@ -192,24 +192,42 @@ fn load_persisted_shortcut(app: &AppHandle) -> Option<String> {
 
 fn start_recording_async(app: &AppHandle) {
     let recorder = Recorder::global();
+    let vad_model = match crate::asr::get_or_init_vad_model(app) {
+        Ok(model) => model,
+        Err(e) => {
+            log::error!("Failed to initialize VAD model: {}", e);
+            return;
+        }
+    };
     let app_clone = app.clone();
 
     if let Ok(mut state) = transcription_buffer().lock() {
         state.clear();
     }
 
+    let engine = app.state::<SpeechEngine>();
+    engine.reset_model_state();
+
     async_runtime::spawn(async move {
         log::info!("Global shortcut pressed; starting recording");
-        match recorder.start() {
+
+        let streaming = crate::settings::get_settings(&app_clone).streaming_enabled;
+        let (streaming_tx, streaming_rx) = if streaming {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        match recorder.start(&vad_model, streaming_tx) {
             Ok(()) => {
                 log::info!("Recording started (shortcut held)");
 
-                let streaming = crate::settings::get_settings(&app_clone).streaming_enabled;
-                log::info!("Global Shortcut: Streaming mode enabled? {}", streaming);
-                if streaming {
+                log::debug!("Global shortcut streaming mode: {}", streaming);
+                if let Some(rx) = streaming_rx {
                     let app_for_loop = app_clone.clone();
                     std::thread::spawn(move || {
-                        run_vad_streaming_loop(&app_for_loop);
+                        run_vad_streaming_loop(rx, &app_for_loop);
                     });
                 }
             }
@@ -218,16 +236,17 @@ fn start_recording_async(app: &AppHandle) {
     });
 }
 
-fn run_vad_streaming_loop(app: &AppHandle) {
-    let model = crate::asr::get_or_init_vad_model(app);
+use crate::audio_processing::ProcessingEvent;
 
-    crate::streaming::run_streaming(model, |samples| {
-        let engine = app.state::<SpeechEngine>();
-        match engine.transcribe_samples(samples) {
-            Ok(text) if !text.is_empty() => append_and_type(text),
-            Ok(_) => {}
-            Err(e) => log::error!("Transcription error: {e}"),
-        }
+fn run_vad_streaming_loop(rx: std::sync::mpsc::Receiver<ProcessingEvent>, app: &AppHandle) {
+    let engine = app.state::<SpeechEngine>();
+    crate::streaming::process_streaming_loop(rx, &engine, |text| {
+        log::info!(
+            "Shortcut transcription chunk ({} chars)",
+            text.chars().count()
+        );
+        log::debug!("Shortcut text chunk: '{}'", text);
+        append_and_type(text);
     });
 }
 
@@ -241,8 +260,11 @@ fn stop_recording_async(app: &AppHandle) {
                 let streaming = crate::settings::get_settings(&app_handle).streaming_enabled;
                 if !streaming {
                     let engine = app_handle.state::<SpeechEngine>();
-                    match engine.transcribe_samples(samples) {
-                        Ok(text) if !text.is_empty() => append_and_type(text),
+                    match engine.transcribe_samples(samples, false) {
+                        Ok(text) if !text.is_empty() => {
+                            log::info!("Shortcut transcribed (final): '{}'", text);
+                            append_and_type(text);
+                        }
                         Ok(_) => {}
                         Err(e) => log::error!("Transcription error: {e}"),
                     }
@@ -258,10 +280,25 @@ fn stop_recording_async(app: &AppHandle) {
 fn make_handler() -> impl Fn(&AppHandle, &Shortcut, ShortcutEvent) + Send + Sync {
     move |app: &AppHandle, _shortcut: &Shortcut, event| {
         let recorder = Recorder::global();
+        log::trace!(
+            "Shortcut event: {:?}, state: {:?}",
+            event.state(),
+            event.id()
+        );
         match event.state() {
-            ShortcutState::Pressed if !recorder.is_recording() => start_recording_async(app),
-            ShortcutState::Released if recorder.is_recording() => stop_recording_async(app),
-            _ => log::debug!("Shortcut event ignored in state {:?}", event.state()),
+            ShortcutState::Pressed if !recorder.is_recording() => {
+                log::info!("Shortcut PRESSED -> Starting recording");
+                start_recording_async(app);
+            }
+            ShortcutState::Released if recorder.is_recording() => {
+                log::info!("Shortcut RELEASED -> Stopping recording");
+                stop_recording_async(app);
+            }
+            _ => log::trace!(
+                "Shortcut event ignored in state {:?} (is_recording={})",
+                event.state(),
+                recorder.is_recording()
+            ),
         }
     }
 }

@@ -10,8 +10,6 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::asr::decoder::DecoderWorkspace;
-
 const THREAD_ENV: &str = "ORT_THREADS";
 
 #[derive(Debug, Clone)]
@@ -92,15 +90,30 @@ fn resolve_thread_count() -> usize {
     physical
 }
 
+#[derive(Debug, Clone)]
+pub struct InferenceConfig {
+    pub temperature: f32,
+    pub convert_timestamps: bool,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            convert_timestamps: true,
+        }
+    }
+}
+
 pub struct AsrModel {
     pub(super) encoder: Session,
     pub(super) decoder_joint: Session,
     pub(super) preprocessor: Session,
-
     pub(super) vocab: Vec<String>,
     pub(super) blank_idx: i32,
     pub(super) vocab_size: usize,
-    pub(super) decoder_workspace: DecoderWorkspace,
+    pub(super) cached_workspace: Option<crate::asr::decoder::DecoderWorkspace>,
+    pub(super) cached_last_token: i32,
 }
 
 impl Drop for AsrModel {
@@ -117,8 +130,6 @@ impl AsrModel {
         let decoder_joint =
             Self::init_session(&model_dir, "decoder_joint-model", threads, quantized)?;
         let preprocessor = Self::init_session(&model_dir, "nemo128", threads, false)?;
-        let decoder_workspace = DecoderWorkspace::new(&decoder_joint)?;
-
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
 
@@ -141,7 +152,8 @@ impl AsrModel {
             vocab,
             blank_idx,
             vocab_size,
-            decoder_workspace,
+            cached_workspace: None,
+            cached_last_token: blank_idx,
         })
     }
 
@@ -190,7 +202,7 @@ impl AsrModel {
         let session = builder.commit_from_file(model_dir.as_ref().join(&model_filename))?;
 
         for input in &session.inputs {
-            log::info!(
+            log::debug!(
                 "Model '{}' input: name={}, type={:?}",
                 model_filename,
                 input.name,
@@ -302,6 +314,7 @@ impl AsrModel {
         &mut self,
         waveforms: &ArrayViewD<f32>,
         waveforms_len: &ArrayViewD<i64>,
+        config: &InferenceConfig,
     ) -> Result<Vec<Transcript>, AsrError> {
         let recognize_start = Instant::now();
 
@@ -310,9 +323,26 @@ impl AsrModel {
             self.encode(&features.view(), &features_lens.view())?;
 
         let mut results = Vec::new();
+        let cached_workspace = self.cached_workspace.take();
+        let mut session = crate::asr::decoder::DecoderSession::new(
+            self,
+            cached_workspace,
+            self.cached_last_token,
+        )?;
+
+        let mut raw_results = Vec::new();
+
         for (encodings, &encodings_len) in encoder_out.outer_iter().zip(encoder_out_lens.iter()) {
             let (tokens, timestamps) =
-                self.decode_sequence(&encodings.view(), encodings_len as usize)?;
+                session.decode_sequence(&encodings.view(), encodings_len as usize, config)?;
+            raw_results.push((tokens, timestamps));
+        }
+
+        let (ws, last_token) = session.into_parts();
+        self.cached_workspace = Some(ws);
+        self.cached_last_token = last_token;
+
+        for (tokens, timestamps) in raw_results {
             let result = self.decode_tokens(tokens, timestamps);
             results.push(result);
         }
@@ -326,15 +356,29 @@ impl AsrModel {
         Ok(results)
     }
 
-    pub fn transcribe_samples(&mut self, samples: Vec<f32>) -> Result<Transcript, AsrError> {
+    pub fn transcribe_samples(
+        &mut self,
+        samples: Vec<f32>,
+        reuse_workspace: bool,
+        config: Option<InferenceConfig>,
+    ) -> Result<Transcript, AsrError> {
         let batch_size = 1;
         let samples_len = samples.len();
 
-        let audio = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
+        let rms: f32 = (samples.iter().map(|s| s * s).sum::<f32>() / samples_len as f32).sqrt();
+        log::debug!("Transcription RMS: {:.4} (len: {})", rms, samples_len);
 
+        let audio = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
         let audio_lengths = Array1::from_vec(vec![samples_len as i64]).into_dyn();
 
-        let results = self.recognize_batch(&audio.view(), &audio_lengths.view())?;
+        if !reuse_workspace {
+            log::debug!("Gap detected, resetting workspace AND context");
+            self.cached_workspace = None;
+            self.cached_last_token = self.blank_idx;
+        }
+
+        let config = config.unwrap_or_default();
+        let results = self.recognize_batch(&audio.view(), &audio_lengths.view(), &config)?;
 
         let timestamped_result = results.into_iter().next().ok_or_else(|| {
             AsrError::Io(std::io::Error::new(
@@ -344,5 +388,10 @@ impl AsrModel {
         })?;
 
         Ok(timestamped_result)
+    }
+
+    pub fn reset_state(&mut self) {
+        self.cached_workspace = None;
+        self.cached_last_token = self.blank_idx;
     }
 }

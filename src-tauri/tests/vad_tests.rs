@@ -1,7 +1,7 @@
 use silent_keys_lib::vad::{VadError, VAD_CHUNK_SIZE};
 
 #[test]
-fn vad_error_user_messages_are_not_empty() {
+fn vad_error_display_messages_are_not_empty() {
     let errors = [
         VadError::Ort(ort::Error::new("test error")),
         VadError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "test")),
@@ -16,7 +16,7 @@ fn vad_error_user_messages_are_not_empty() {
     ];
 
     for err in errors {
-        assert!(!err.user_message().is_empty());
+        assert!(!err.to_string().is_empty());
     }
 }
 

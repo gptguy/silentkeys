@@ -73,28 +73,39 @@ pub fn retry_model_download(state: State<'_, SpeechEngine>) -> Result<(), String
 #[tauri::command]
 pub fn start_recording(app: AppHandle) -> Result<(), String> {
     log::info!("Tauri command start_recording invoked");
-    Recorder::global()
-        .start()
-        .map_err(|e| e.user_message().to_string())?;
 
     let streaming = crate::settings::get_settings(&app).streaming_enabled;
-    log::info!(
-        "Command start_recording: Streaming mode enabled? {}",
-        streaming
-    );
-    if streaming {
+
+    let vad_path = crate::asr::get_or_init_vad_model(&app)?;
+
+    let engine = app.state::<SpeechEngine>();
+    engine.reset_model_state();
+
+    let streaming_tx = if streaming {
+        let (tx, rx) = std::sync::mpsc::channel();
         let app_handle = app.clone();
+
+        log::info!("Starting streaming thread");
         std::thread::spawn(move || {
-            let model = crate::asr::get_or_init_vad_model(&app_handle);
-            crate::streaming::run_streaming(model, |samples| {
-                let state = app_handle.state::<SpeechEngine>();
-                if let Ok(text) = state.transcribe_samples(samples) {
-                    log::info!("UI streaming: emitting transcription (len={})", text.len());
-                    let _ = app_handle.emit("transcription_update", text);
-                }
+            let state = app_handle.state::<SpeechEngine>();
+            crate::streaming::process_streaming_loop(rx, &state, |text| {
+                log::debug!(
+                    "UI streaming: emitting transcription (len={} chars)",
+                    text.len()
+                );
+                let _ = app_handle.emit("transcription_update", text);
             });
         });
-    }
+        Some(tx)
+    } else {
+        None
+    };
+
+    Recorder::global()
+        .start(&vad_path, streaming_tx)
+        .map_err(|e| e.user_message().to_string())?;
+
+    log::info!("Recorder started (Streaming={})", streaming);
     Ok(())
 }
 
@@ -114,7 +125,7 @@ pub fn stop_recording(app: AppHandle, state: State<'_, SpeechEngine>) -> Result<
         return Ok(String::new());
     }
 
-    state.transcribe_samples(samples)
+    state.transcribe_samples(samples, false)
 }
 
 #[cfg(desktop)]

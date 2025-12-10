@@ -6,7 +6,7 @@ use ort::inputs;
 use ort::value::TensorRef;
 use regex::Regex;
 
-use crate::asr::recognizer::{AsrError, AsrModel, Transcript};
+use crate::asr::recognizer::{AsrError, AsrModel, InferenceConfig, Transcript};
 
 type DecoderState = (Array3<f32>, Array3<f32>);
 
@@ -16,6 +16,156 @@ const MAX_TOKENS_PER_STEP: usize = 10;
 
 static DECODE_SPACE_RE: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"\A\s|\s\B|(\s)\b"));
+
+pub struct DecoderSession<'m> {
+    model: &'m mut AsrModel,
+    workspace: DecoderWorkspace,
+    last_token: i32,
+}
+
+impl<'m> DecoderSession<'m> {
+    pub(crate) fn new(
+        model: &'m mut AsrModel,
+        workspace: Option<DecoderWorkspace>,
+        last_token: i32,
+    ) -> Result<Self, AsrError> {
+        let workspace = if let Some(ws) = workspace {
+            log::debug!("Reusing cached decoder workspace");
+            ws
+        } else {
+            log::debug!("Initializing new decoder workspace");
+            DecoderWorkspace::new(&model.decoder_joint)?
+        };
+
+        log::debug!("Decoder session initialized with last_token={}", last_token);
+
+        Ok(Self {
+            model,
+            workspace,
+            last_token,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (DecoderWorkspace, i32) {
+        (self.workspace, self.last_token)
+    }
+
+    pub(crate) fn decode_sequence(
+        &mut self,
+        encodings: &ArrayViewD<f32>,
+        encodings_len: usize,
+        _config: &InferenceConfig,
+    ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
+        let decode_start = Instant::now();
+        let mut tokens = Vec::with_capacity(std::cmp::max(1, encodings_len / 2));
+        let mut timestamps = Vec::with_capacity(std::cmp::max(1, encodings_len / 2));
+
+        let mut t = 0;
+        let mut emitted_tokens = 0;
+
+        while t < encodings_len {
+            let encoder_step = encodings.slice(ndarray::s![t, ..]);
+            self.workspace.set_encoder_step(&encoder_step);
+
+            let target_token = if let Some(last) = tokens.last() {
+                *last
+            } else {
+                self.last_token
+            };
+            self.workspace.set_target(target_token);
+
+            let inputs = inputs![
+                "encoder_outputs" => TensorRef::from_array_view(self.workspace.encoder_step.view())?,
+                "targets" => TensorRef::from_array_view(self.workspace.targets.view())?,
+                "target_length" => TensorRef::from_array_view(self.workspace.target_length.view())?,
+                "input_states_1" => TensorRef::from_array_view(self.workspace.state.0.view())?,
+                "input_states_2" => TensorRef::from_array_view(self.workspace.state.1.view())?,
+            ];
+
+            let outputs = self.model.decoder_joint.run(inputs)?;
+
+            let logits = outputs
+                .get("outputs")
+                .ok_or_else(|| AsrError::OutputNotFound("outputs".to_string()))?
+                .try_extract_array()?;
+
+            let logits = logits.remove_axis(ndarray::Axis(0));
+
+            let vocab_logits_slice: &[f32] = logits.as_slice().ok_or_else(|| {
+                AsrError::Shape(ndarray::ShapeError::from_kind(
+                    ndarray::ErrorKind::IncompatibleShape,
+                ))
+            })?;
+
+            let vocab_logits = if logits.len() > self.model.vocab_size {
+                &vocab_logits_slice[..self.model.vocab_size]
+            } else {
+                vocab_logits_slice
+            };
+
+            let token = vocab_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(self.model.blank_idx, |(idx, _)| idx as i32);
+
+            if token != self.model.blank_idx {
+                let state1 = outputs
+                    .get("output_states_1")
+                    .ok_or_else(|| AsrError::OutputNotFound("output_states_1".to_string()))?
+                    .try_extract_array::<f32>()?;
+                let state2 = outputs
+                    .get("output_states_2")
+                    .ok_or_else(|| AsrError::OutputNotFound("output_states_2".to_string()))?
+                    .try_extract_array::<f32>()?;
+
+                if let Ok(state1_view) = state1.view().into_dimensionality::<ndarray::Ix3>() {
+                    if self.workspace.state.0.shape() == state1_view.shape() {
+                        self.workspace.state.0.assign(&state1_view);
+                    } else {
+                        log::warn!(
+                            "Decoder state_1 shape changed: {:?} -> {:?}",
+                            self.workspace.state.0.shape(),
+                            state1_view.shape()
+                        );
+                        self.workspace.state.0 = state1_view.to_owned();
+                    }
+                }
+                if let Ok(state2_view) = state2.view().into_dimensionality::<ndarray::Ix3>() {
+                    if self.workspace.state.1.shape() == state2_view.shape() {
+                        self.workspace.state.1.assign(&state2_view);
+                    } else {
+                        log::warn!(
+                            "Decoder state_2 shape changed: {:?} -> {:?}",
+                            self.workspace.state.1.shape(),
+                            state2_view.shape()
+                        );
+                        self.workspace.state.1 = state2_view.to_owned();
+                    }
+                }
+
+                tokens.push(token);
+                timestamps.push(t);
+                emitted_tokens += 1;
+                self.last_token = token;
+            }
+
+            if token == self.model.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
+                t += 1;
+                emitted_tokens = 0;
+            }
+        }
+
+        log::debug!(
+            "decode_sequence completed in {:?} (frames: {}, tokens: {})",
+            decode_start.elapsed(),
+            encodings_len,
+            tokens.len()
+        );
+
+        Ok((tokens, timestamps))
+    }
+}
 
 pub(crate) struct DecoderWorkspace {
     encoder_step: Array3<f32>,
@@ -32,8 +182,15 @@ impl DecoderWorkspace {
             .find(|input| input.name == "encoder_outputs")
             .and_then(|input| input.input_type.tensor_shape())
             .and_then(|shape| shape.get(1).copied())
-            .and_then(|d| usize::try_from(d).ok())
-            .unwrap_or(1024);
+            .and_then(|d| usize::try_from(d).ok());
+
+        let encoder_dim = match encoder_dim {
+            Some(dim) => dim,
+            None => {
+                log::warn!("Could not determine encoder_dim from model, falling back to 1024");
+                1024
+            }
+        };
 
         let state1_shape = session
             .inputs
@@ -64,12 +221,6 @@ impl DecoderWorkspace {
         })
     }
 
-    #[inline]
-    pub(crate) fn reset_state(&mut self) {
-        self.state.0.fill(0.0);
-        self.state.1.fill(0.0);
-    }
-
     pub(crate) fn set_encoder_step(&mut self, frame: &ArrayView1<f32>) {
         let mut view = self.encoder_step.index_axis_mut(ndarray::Axis(2), 0);
         let mut view = view.index_axis_mut(ndarray::Axis(0), 0);
@@ -82,115 +233,6 @@ impl DecoderWorkspace {
 }
 
 impl AsrModel {
-    pub(crate) fn decode_sequence(
-        &mut self,
-        encodings: &ArrayViewD<f32>,
-        encodings_len: usize,
-    ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
-        let decode_start = Instant::now();
-        let mut tokens = Vec::with_capacity(encodings_len / 2 + 4);
-        let mut timestamps = Vec::with_capacity(encodings_len / 2 + 4);
-
-        let workspace = &mut self.decoder_workspace;
-        workspace.reset_state();
-
-        let mut t = 0;
-        let mut emitted_tokens = 0;
-
-        while t < encodings_len {
-            let encoder_step = encodings.slice(ndarray::s![t, ..]);
-            workspace.set_encoder_step(&encoder_step);
-
-            let target_token = tokens.last().copied().unwrap_or(self.blank_idx);
-            workspace.set_target(target_token);
-
-            let inputs = inputs![
-                "encoder_outputs" => TensorRef::from_array_view(workspace.encoder_step.view())?,
-                "targets" => TensorRef::from_array_view(workspace.targets.view())?,
-                "target_length" => TensorRef::from_array_view(workspace.target_length.view())?,
-                "input_states_1" => TensorRef::from_array_view(workspace.state.0.view())?,
-                "input_states_2" => TensorRef::from_array_view(workspace.state.1.view())?,
-            ];
-
-            let outputs = self.decoder_joint.run(inputs)?;
-
-            let logits = outputs
-                .get("outputs")
-                .ok_or_else(|| AsrError::OutputNotFound("outputs".to_string()))?
-                .try_extract_array()?;
-
-            let logits = logits.remove_axis(ndarray::Axis(0));
-
-            let vocab_logits_slice: &[f32] = logits.as_slice().ok_or_else(|| {
-                AsrError::Shape(ndarray::ShapeError::from_kind(
-                    ndarray::ErrorKind::IncompatibleShape,
-                ))
-            })?;
-
-            let vocab_logits = if logits.len() > self.vocab_size {
-                log::trace!(
-                    "TDT model detected: splitting {} logits into vocab({}) + duration",
-                    logits.len(),
-                    self.vocab_size
-                );
-                &vocab_logits_slice[..self.vocab_size]
-            } else {
-                vocab_logits_slice
-            };
-
-            let token = vocab_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as i32)
-                .unwrap_or(self.blank_idx);
-
-            if token != self.blank_idx {
-                let state1 = outputs
-                    .get("output_states_1")
-                    .ok_or_else(|| AsrError::OutputNotFound("output_states_1".to_string()))?
-                    .try_extract_array::<f32>()?;
-                let state2 = outputs
-                    .get("output_states_2")
-                    .ok_or_else(|| AsrError::OutputNotFound("output_states_2".to_string()))?
-                    .try_extract_array::<f32>()?;
-
-                if let Ok(state1_view) = state1.view().into_dimensionality::<ndarray::Ix3>() {
-                    if workspace.state.0.shape() == state1_view.shape() {
-                        workspace.state.0.assign(&state1_view);
-                    } else {
-                        workspace.state.0 = state1_view.to_owned();
-                    }
-                }
-                if let Ok(state2_view) = state2.view().into_dimensionality::<ndarray::Ix3>() {
-                    if workspace.state.1.shape() == state2_view.shape() {
-                        workspace.state.1.assign(&state2_view);
-                    } else {
-                        workspace.state.1 = state2_view.to_owned();
-                    }
-                }
-
-                tokens.push(token);
-                timestamps.push(t);
-                emitted_tokens += 1;
-            }
-
-            if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
-                t += 1;
-                emitted_tokens = 0;
-            }
-        }
-
-        log::debug!(
-            "decode_sequence completed in {:?} (frames: {}, tokens: {})",
-            decode_start.elapsed(),
-            encodings_len,
-            tokens.len()
-        );
-
-        Ok((tokens, timestamps))
-    }
-
     pub(crate) fn decode_tokens(&self, ids: Vec<i32>, timestamps: Vec<usize>) -> Transcript {
         let tokens: Vec<String> = ids
             .iter()

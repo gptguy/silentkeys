@@ -29,6 +29,60 @@ const MODEL_FILES: &[&str] = &[
 const MAX_RETRIES: usize = 3;
 const RETRY_BACKOFF_SECS: u64 = 2;
 
+fn missing_model_files(snapshot_dir: &Path) -> Vec<String> {
+    MODEL_FILES
+        .iter()
+        .filter_map(|file| {
+            let path = snapshot_dir.join(file);
+            if path.exists() {
+                None
+            } else {
+                Some((*file).to_string())
+            }
+        })
+        .collect()
+}
+
+pub fn missing_model_files_for_tests(snapshot_dir: &Path) -> Vec<String> {
+    missing_model_files(snapshot_dir)
+}
+
+fn download_missing_files(snapshot_dir: &Path, missing_files: &[String]) -> Result<(), AsrError> {
+    if missing_files.is_empty() {
+        return Ok(());
+    }
+
+    start_tracking(missing_files.len());
+
+    let result: Result<(), AsrError> = (|| {
+        for (index, file) in missing_files.iter().enumerate() {
+            set_file_index(index + 1);
+            let dest = snapshot_dir.join(file);
+
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let url = format!("{MODEL_BASE_URL}/{file}");
+            download_asset(&url, &dest)?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            mark_finished();
+            log::info!("Repaired ASR snapshot at {}", snapshot_dir.display());
+            Ok(())
+        }
+        Err(err) => {
+            log::error!("ASR model repair download failed: {}", err);
+            record_failure(err.user_message().to_string());
+            Err(err)
+        }
+    }
+}
+
 pub fn vad_model_path(app: &AppHandle) -> PathBuf {
     let root = default_model_root(app);
     root.join("snapshots")
@@ -83,41 +137,72 @@ pub fn fallback_model_root() -> PathBuf {
         .join("models--istupakov--parakeet-tdt-0.6b-v3-onnx")
 }
 
+fn ensure_snapshot_complete(root: &Path, snapshot_dir: PathBuf) -> Result<PathBuf, AsrError> {
+    if !snapshot_dir.is_dir() {
+        log::warn!(
+            "Model snapshot directory missing at {}. Downloading fresh snapshot.",
+            snapshot_dir.display()
+        );
+        return download_default_snapshot(root);
+    }
+
+    let missing = missing_model_files(&snapshot_dir);
+    if missing.is_empty() {
+        return Ok(snapshot_dir);
+    }
+
+    log::warn!(
+        "Model snapshot at {} missing required files ({}). Attempting to download missing assets.",
+        snapshot_dir.display(),
+        missing.join(", ")
+    );
+
+    match download_missing_files(&snapshot_dir, &missing) {
+        Ok(()) => Ok(snapshot_dir),
+        Err(err) => {
+            log::warn!(
+                "Snapshot repair failed, falling back to fresh download: {}",
+                err
+            );
+            download_default_snapshot(root)
+        }
+    }
+}
+
 pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
     let root = root.as_ref();
-    log::info!("resolve_model_dir: checking root {}", root.display());
+    log::debug!("resolve_model_dir: checking root {}", root.display());
 
     let refs_main = root.join("refs").join("main");
 
     if refs_main.exists() {
         let commit = fs::read_to_string(&refs_main)?.trim().to_string();
         let snap = root.join("snapshots").join(&commit);
-        log::info!(
+        log::debug!(
             "Found refs/main: {}, checking snapshot at {}",
             commit,
             snap.display()
         );
         if snap.is_dir() {
-            log::info!("Snapshot directory exists and is valid.");
-            return Ok(snap);
+            log::debug!("Snapshot directory exists and is valid.");
+            return ensure_snapshot_complete(root, snap);
         } else {
             log::warn!("Snapshot directory from refs/main does NOT exist or is not a dir.");
         }
     } else {
-        log::info!("refs/main not found at {}", refs_main.display());
+        log::debug!("refs/main not found at {}", refs_main.display());
     }
 
     let snapshots = root.join("snapshots");
     if snapshots.is_dir() {
-        log::info!("Scanning snapshots dir: {}", snapshots.display());
+        log::debug!("Scanning snapshots dir: {}", snapshots.display());
         let mut newest: Option<(SystemTime, PathBuf)> = None;
         for entry in fs::read_dir(&snapshots)? {
             let entry = entry?;
             let path = entry.path();
-            log::debug!("Found entry: {}", path.display());
 
             if !entry.file_type()?.is_dir() {
-                log::debug!("Skipping non-dir: {}", path.display());
+                log::trace!("Skipping non-dir: {}", path.display());
                 continue;
             }
 
@@ -128,7 +213,7 @@ pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
 
             match &mut newest {
                 Some((ts, best)) if modified > *ts => {
-                    log::debug!(
+                    log::trace!(
                         "Newer snapshot found: {} (ts={:?})",
                         path.display(),
                         modified
@@ -143,7 +228,7 @@ pub fn resolve_model_dir<P: AsRef<Path>>(root: P) -> Result<PathBuf, AsrError> {
 
         if let Some((_, path)) = newest {
             log::info!("Selected newest snapshot: {}", path.display());
-            return Ok(path);
+            return ensure_snapshot_complete(root, path);
         } else {
             log::warn!("No valid directories found in snapshots folder.");
         }
@@ -189,15 +274,7 @@ fn download_default_snapshot(root: &Path) -> Result<PathBuf, AsrError> {
             download_asset(VAD_MODEL_URL, &vad_dest)?;
         }
 
-        let refs_dir = root.join("refs");
-        fs::create_dir_all(&refs_dir)?;
-        let refs_main = refs_dir.join("main");
-        if !refs_main.exists() {
-            if let Some(name) = download_dir.file_name().and_then(|n| n.to_str()) {
-                fs::write(&refs_main, name)
-                    .map_err(|e| AsrError::Download(format!("write refs/main: {e}")))?;
-            }
-        }
+        write_refs_main(root, &download_dir)?;
 
         Ok(download_dir)
     })();
@@ -219,22 +296,25 @@ fn download_asset(url: &str, dest: &Path) -> Result<(), AsrError> {
     let tmp = dest.with_extension("download");
     let mut last_err: Option<AsrError> = None;
 
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .build();
+
     for attempt in 1..=MAX_RETRIES {
-        if tmp.exists() {
-            let _ = fs::remove_file(&tmp);
-        }
+        log::info!(
+            "Downloading model asset to {} from {url} (attempt {attempt}/{MAX_RETRIES})",
+            dest.display()
+        );
 
-        log::info!("Downloading model asset from {url} (attempt {attempt}/{MAX_RETRIES})...");
-
-        match try_download_once(url, &tmp, dest) {
+        match try_download_resumable(&agent, url, &tmp, dest) {
             Ok(()) => return Ok(()),
             Err(err) => {
+                log::warn!("Download attempt {} failed: {}", attempt, err);
                 last_err = Some(err);
 
                 if attempt < MAX_RETRIES {
                     std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS * attempt as u64));
-                } else if tmp.exists() {
-                    let _ = fs::remove_file(&tmp);
                 }
             }
         }
@@ -243,23 +323,86 @@ fn download_asset(url: &str, dest: &Path) -> Result<(), AsrError> {
     Err(last_err.unwrap_or_else(|| AsrError::Download(format!("{url}: failed to download"))))
 }
 
-fn try_download_once(url: &str, tmp: &Path, dest: &Path) -> Result<(), AsrError> {
-    let response =
-        reqwest::blocking::get(url).map_err(|e| AsrError::Download(format!("{url}: {e}")))?;
+fn write_refs_main(root: &Path, snapshot_dir: &Path) -> Result<(), AsrError> {
+    let refs_dir = root.join("refs");
+    fs::create_dir_all(&refs_dir)?;
+
+    let snapshot_name = snapshot_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AsrError::Download("invalid snapshot directory name".to_string()))?;
+
+    let refs_main = refs_dir.join("main");
+    fs::write(&refs_main, snapshot_name)
+        .map_err(|e| AsrError::Download(format!("write refs/main: {e}")))?;
+
+    Ok(())
+}
+
+fn try_download_resumable(
+    agent: &ureq::Agent,
+    url: &str,
+    tmp: &Path,
+    dest: &Path,
+) -> Result<(), AsrError> {
+    // 1. Check current size of tmp file
+    let current_len = if tmp.exists() {
+        fs::metadata(tmp).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    // 2. Make Request
+    let mut request = agent.get(url);
+    if current_len > 0 {
+        request = request.set("Range", &format!("bytes={}-", current_len));
+    }
+
+    let response = request
+        .call()
+        .map_err(|e| AsrError::Download(format!("{url}: request failed: {e}")))?;
+
     let status = response.status();
-    if !status.is_success() {
+    // ureq returns success for 2xx.
+    if !(200..300).contains(&status) {
         return Err(AsrError::Download(format!(
             "{url}: unexpected status {status}"
         )));
     }
 
-    let total_size = response.content_length().unwrap_or(0);
-    let mut downloaded: u64 = 0;
+    // 3. Handle Response
+    let total_size = if status == 206 {
+        // Partial Content
+        let content_len = response
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        current_len + content_len
+    } else {
+        // If server didn't respect Range (returned 200), we overwrite
+        response
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
 
-    let mut file = fs::File::create(tmp)?;
-    let mut reader = response;
+    let mut file = if status == 206 {
+        log::debug!("Resuming download from byte {}", current_len);
+        fs::OpenOptions::new().create(true).append(true).open(tmp)?
+    } else {
+        if current_len > 0 {
+            log::warn!("Server does not support resuming or file changed (status {}), restarting download.", status);
+        }
+        fs::File::create(tmp)?
+    };
+
+    // Update progress bar
+    update_download_bytes(if status == 206 { current_len } else { 0 }, total_size);
+
+    let mut downloaded = if status == 206 { current_len } else { 0 };
     let mut buffer = [0; 8192];
 
+    let mut reader = response.into_reader();
     loop {
         let bytes_read = reader
             .read(&mut buffer)
@@ -276,7 +419,14 @@ fn try_download_once(url: &str, tmp: &Path, dest: &Path) -> Result<(), AsrError>
         update_download_bytes(downloaded, total_size);
     }
 
-    fs::rename(tmp, dest)?;
+    // Verify size if known
+    if total_size > 0 && downloaded != total_size {
+        return Err(AsrError::Download(format!(
+            "Incomplete download: expected {} bytes, got {}",
+            total_size, downloaded
+        )));
+    }
 
+    fs::rename(tmp, dest)?;
     Ok(())
 }

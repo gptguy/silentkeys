@@ -86,7 +86,7 @@ fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
 fn handle_run_event(_app_handle: &AppHandle, _event: RunEvent) {}
 
 fn on_second_instance(app: &AppHandle, argv: Vec<String>, cwd: String) {
-    log::info!("{}, {argv:?}, {cwd}", app.package_info().name);
+    log::info!("Second instance detected (args={argv:?}, cwd={cwd})");
     if let Err(err) = app.emit("single-instance", ()) {
         log::error!("Failed to emit single-instance event: {err}");
     }
