@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -7,27 +9,51 @@ use ort::value::TensorRef;
 use regex::Regex;
 
 use crate::asr::recognizer::{AsrError, AsrModel, InferenceConfig, Transcript};
+use crate::asr::FRAME_DURATION_SEC;
 
 type DecoderState = (Array3<f32>, Array3<f32>);
-
-const SUBSAMPLING_FACTOR: usize = 8;
-const WINDOW_SIZE: f32 = 0.01;
-const MAX_TOKENS_PER_STEP: usize = 10;
 
 static DECODE_SPACE_RE: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"\A\s|\s\B|(\s)\b"));
 
-pub struct DecoderSession<'m> {
-    model: &'m mut AsrModel,
-    workspace: DecoderWorkspace,
+#[derive(Clone)]
+struct Hypothesis {
+    tokens: Vec<i32>,
+    timestamps: Vec<usize>,
+    score: f32,
+    state: DecoderState,
     last_token: i32,
 }
 
-impl<'m> DecoderSession<'m> {
+struct StepScores {
+    blank_score: f32,
+    top_tokens: Vec<(usize, f32)>,
+    output_state: DecoderState,
+}
+
+fn retain_top_k(hyps: &mut Vec<Hypothesis>, k: usize) {
+    if k == 0 || hyps.len() <= k {
+        return;
+    }
+    hyps.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    hyps.truncate(k);
+}
+
+pub struct DecoderSession {
+    workspace: DecoderWorkspace,
+    last_token: i32,
+    hotword_mask: Option<Vec<bool>>,
+    hotword_boost: f32,
+    vocab_size: usize,
+    blank_idx: i32,
+}
+
+impl DecoderSession {
     pub(crate) fn new(
-        model: &'m mut AsrModel,
+        model: &AsrModel,
         workspace: Option<DecoderWorkspace>,
         last_token: i32,
+        config: &InferenceConfig,
     ) -> Result<Self, AsrError> {
         let workspace = if let Some(ws) = workspace {
             log::debug!("Reusing cached decoder workspace");
@@ -37,12 +63,17 @@ impl<'m> DecoderSession<'m> {
             DecoderWorkspace::new(&model.decoder_joint)?
         };
 
+        let hotword_mask = build_hotword_mask(model, config);
+
         log::debug!("Decoder session initialized with last_token={}", last_token);
 
         Ok(Self {
-            model,
             workspace,
             last_token,
+            hotword_mask,
+            hotword_boost: config.hotword_boost,
+            vocab_size: model.vocab_size,
+            blank_idx: model.blank_idx,
         })
     }
 
@@ -52,13 +83,37 @@ impl<'m> DecoderSession<'m> {
 
     pub(crate) fn decode_sequence(
         &mut self,
+        model: &mut AsrModel,
         encodings: &ArrayViewD<f32>,
         encodings_len: usize,
-        _config: &InferenceConfig,
+        config: &InferenceConfig,
+    ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
+        let beam_width = config.beam_width.max(1);
+        if beam_width <= 1 {
+            log::debug!("Decoding (Greedy) frames_len={}", encodings_len);
+            return self.decode_sequence_greedy(model, encodings, encodings_len, config);
+        }
+        log::debug!(
+            "Decoding (Beam={}) frames_len={}",
+            beam_width,
+            encodings_len
+        );
+        self.decode_sequence_beam(model, encodings, encodings_len, config, beam_width)
+    }
+
+    fn decode_sequence_greedy(
+        &mut self,
+        model: &mut AsrModel,
+        encodings: &ArrayViewD<f32>,
+        encodings_len: usize,
+        config: &InferenceConfig,
     ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
         let decode_start = Instant::now();
         let mut tokens = Vec::with_capacity(std::cmp::max(1, encodings_len / 2));
         let mut timestamps = Vec::with_capacity(std::cmp::max(1, encodings_len / 2));
+
+        let max_tokens_per_step = config.max_tokens_per_step.max(1);
+        let temperature = Self::normalized_temperature(config);
 
         let mut t = 0;
         let mut emitted_tokens = 0;
@@ -82,7 +137,7 @@ impl<'m> DecoderSession<'m> {
                 "input_states_2" => TensorRef::from_array_view(self.workspace.state.1.view())?,
             ];
 
-            let outputs = self.model.decoder_joint.run(inputs)?;
+            let outputs = model.decoder_joint.run(inputs)?;
 
             let logits = outputs
                 .get("outputs")
@@ -97,19 +152,45 @@ impl<'m> DecoderSession<'m> {
                 ))
             })?;
 
-            let vocab_logits = if logits.len() > self.model.vocab_size {
-                &vocab_logits_slice[..self.model.vocab_size]
+            let vocab_logits = if logits.len() > self.vocab_size {
+                &vocab_logits_slice[..self.vocab_size]
             } else {
                 vocab_logits_slice
             };
 
-            let token = vocab_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map_or(self.model.blank_idx, |(idx, _)| idx as i32);
+            let mut best_idx = self.blank_idx as usize;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut blank_score = f32::NEG_INFINITY;
 
-            if token != self.model.blank_idx {
+            for (idx, &logit) in vocab_logits.iter().enumerate() {
+                let mut score = logit;
+                if temperature != 1.0 {
+                    score /= temperature;
+                }
+                if let Some(mask) = self.hotword_mask.as_ref() {
+                    if idx < mask.len() && mask[idx] {
+                        score += self.hotword_boost;
+                    }
+                }
+                if idx == self.blank_idx as usize {
+                    blank_score = score;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_idx = idx;
+                }
+            }
+
+            let mut token = best_idx as i32;
+            if token != self.blank_idx
+                && config.min_blank_margin > 0.0
+                && blank_score.is_finite()
+                && (best_score - blank_score) < config.min_blank_margin
+            {
+                token = self.blank_idx;
+            }
+
+            if token != self.blank_idx {
                 let state1 = outputs
                     .get("output_states_1")
                     .ok_or_else(|| AsrError::OutputNotFound("output_states_1".to_string()))?
@@ -119,30 +200,7 @@ impl<'m> DecoderSession<'m> {
                     .ok_or_else(|| AsrError::OutputNotFound("output_states_2".to_string()))?
                     .try_extract_array::<f32>()?;
 
-                if let Ok(state1_view) = state1.view().into_dimensionality::<ndarray::Ix3>() {
-                    if self.workspace.state.0.shape() == state1_view.shape() {
-                        self.workspace.state.0.assign(&state1_view);
-                    } else {
-                        log::warn!(
-                            "Decoder state_1 shape changed: {:?} -> {:?}",
-                            self.workspace.state.0.shape(),
-                            state1_view.shape()
-                        );
-                        self.workspace.state.0 = state1_view.to_owned();
-                    }
-                }
-                if let Ok(state2_view) = state2.view().into_dimensionality::<ndarray::Ix3>() {
-                    if self.workspace.state.1.shape() == state2_view.shape() {
-                        self.workspace.state.1.assign(&state2_view);
-                    } else {
-                        log::warn!(
-                            "Decoder state_2 shape changed: {:?} -> {:?}",
-                            self.workspace.state.1.shape(),
-                            state2_view.shape()
-                        );
-                        self.workspace.state.1 = state2_view.to_owned();
-                    }
-                }
+                self.workspace.assign_state(state1, state2);
 
                 tokens.push(token);
                 timestamps.push(t);
@@ -150,7 +208,7 @@ impl<'m> DecoderSession<'m> {
                 self.last_token = token;
             }
 
-            if token == self.model.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
+            if token == self.blank_idx || emitted_tokens == max_tokens_per_step {
                 t += 1;
                 emitted_tokens = 0;
             }
@@ -165,8 +223,230 @@ impl<'m> DecoderSession<'m> {
 
         Ok((tokens, timestamps))
     }
+
+    fn decode_sequence_beam(
+        &mut self,
+        model: &mut AsrModel,
+        encodings: &ArrayViewD<f32>,
+        encodings_len: usize,
+        config: &InferenceConfig,
+        beam_width: usize,
+    ) -> Result<(Vec<i32>, Vec<usize>), AsrError> {
+        let decode_start = Instant::now();
+        let max_tokens_per_step = config.max_tokens_per_step.max(1);
+
+        let mut beam = vec![Hypothesis {
+            tokens: Vec::with_capacity(std::cmp::max(1, encodings_len / 2)),
+            timestamps: Vec::with_capacity(std::cmp::max(1, encodings_len / 2)),
+            score: 0.0,
+            state: self.workspace.state.clone(),
+            last_token: self.last_token,
+        }];
+
+        for t in 0..encodings_len {
+            let encoder_step = encodings.slice(ndarray::s![t, ..]);
+            let mut blank_candidates = Vec::new();
+            let mut active = beam;
+
+            let mut step = 0;
+            while step < max_tokens_per_step && !active.is_empty() {
+                let mut next_active = Vec::new();
+                for hyp in &active {
+                    let scores = self.step_scores(
+                        model,
+                        &encoder_step,
+                        hyp.last_token,
+                        &hyp.state,
+                        config,
+                        beam_width,
+                    )?;
+
+                    let mut blank_hyp = hyp.clone();
+                    blank_hyp.score += scores.blank_score;
+                    blank_candidates.push(blank_hyp);
+
+                    for (idx, score) in &scores.top_tokens {
+                        let mut next = hyp.clone();
+                        next.score += *score;
+                        next.tokens.push(*idx as i32);
+                        next.timestamps.push(t);
+                        next.state = scores.output_state.clone();
+                        next.last_token = *idx as i32;
+                        next_active.push(next);
+                    }
+                }
+
+                retain_top_k(&mut next_active, beam_width);
+                active = next_active;
+                step += 1;
+            }
+
+            if blank_candidates.is_empty() {
+                blank_candidates = active;
+            }
+
+            retain_top_k(&mut blank_candidates, beam_width);
+            beam = blank_candidates;
+        }
+
+        retain_top_k(&mut beam, 1);
+        let Some(best) = beam.pop() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        let (state1, state2) = best.state;
+        self.workspace.state.0 = state1;
+        self.workspace.state.1 = state2;
+        self.last_token = best.last_token;
+
+        log::debug!(
+            "decode_sequence completed in {:?} (frames: {}, tokens: {})",
+            decode_start.elapsed(),
+            encodings_len,
+            best.tokens.len()
+        );
+
+        Ok((best.tokens, best.timestamps))
+    }
+
+    fn step_scores(
+        &mut self,
+        model: &mut AsrModel,
+        encoder_step: &ArrayView1<f32>,
+        target_token: i32,
+        state: &DecoderState,
+        config: &InferenceConfig,
+        beam_width: usize,
+    ) -> Result<StepScores, AsrError> {
+        self.workspace.set_encoder_step(encoder_step);
+        self.workspace.set_target(target_token);
+
+        self.workspace.state.0 = state.0.clone();
+        self.workspace.state.1 = state.1.clone();
+
+        let inputs = inputs![
+            "encoder_outputs" => TensorRef::from_array_view(self.workspace.encoder_step.view())?,
+            "targets" => TensorRef::from_array_view(self.workspace.targets.view())?,
+            "target_length" => TensorRef::from_array_view(self.workspace.target_length.view())?,
+            "input_states_1" => TensorRef::from_array_view(self.workspace.state.0.view())?,
+            "input_states_2" => TensorRef::from_array_view(self.workspace.state.1.view())?,
+        ];
+
+        let outputs = model.decoder_joint.run(inputs)?;
+
+        let logits = outputs
+            .get("outputs")
+            .ok_or_else(|| AsrError::OutputNotFound("outputs".to_string()))?
+            .try_extract_array()?;
+
+        let logits = logits.remove_axis(ndarray::Axis(0));
+
+        let vocab_logits_slice: &[f32] = logits.as_slice().ok_or_else(|| {
+            AsrError::Shape(ndarray::ShapeError::from_kind(
+                ndarray::ErrorKind::IncompatibleShape,
+            ))
+        })?;
+
+        let vocab_logits = if logits.len() > self.vocab_size {
+            &vocab_logits_slice[..self.vocab_size]
+        } else {
+            vocab_logits_slice
+        };
+
+        let temperature = Self::normalized_temperature(config);
+        let blank_idx = self.blank_idx as usize;
+        let mut blank_score = f32::NEG_INFINITY;
+
+        for (idx, &logit) in vocab_logits.iter().enumerate() {
+            if idx != blank_idx {
+                continue;
+            }
+            let mut score = logit;
+            if temperature != 1.0 {
+                score /= temperature;
+            }
+            blank_score = score;
+            break;
+        }
+
+        let mut top_tokens = Vec::new();
+        let max_tokens = beam_width.max(1);
+        for (idx, &logit) in vocab_logits.iter().enumerate() {
+            if idx == blank_idx {
+                continue;
+            }
+
+            let mut score = logit;
+            if temperature != 1.0 {
+                score /= temperature;
+            }
+            if let Some(mask) = self.hotword_mask.as_ref() {
+                if idx < mask.len() && mask[idx] {
+                    score += self.hotword_boost;
+                }
+            }
+            if config.min_blank_margin > 0.0
+                && blank_score.is_finite()
+                && (score - blank_score) < config.min_blank_margin
+            {
+                continue;
+            }
+
+            Self::push_top_token(&mut top_tokens, idx, score, max_tokens);
+        }
+
+        let state1 = outputs
+            .get("output_states_1")
+            .ok_or_else(|| AsrError::OutputNotFound("output_states_1".to_string()))?
+            .try_extract_array::<f32>()?
+            .into_dimensionality::<ndarray::Ix3>()
+            .map_err(AsrError::Shape)?
+            .to_owned();
+        let state2 = outputs
+            .get("output_states_2")
+            .ok_or_else(|| AsrError::OutputNotFound("output_states_2".to_string()))?
+            .try_extract_array::<f32>()?
+            .into_dimensionality::<ndarray::Ix3>()
+            .map_err(AsrError::Shape)?
+            .to_owned();
+
+        Ok(StepScores {
+            blank_score,
+            top_tokens,
+            output_state: (state1, state2),
+        })
+    }
+
+    fn push_top_token(top: &mut Vec<(usize, f32)>, idx: usize, score: f32, k: usize) {
+        if !score.is_finite() {
+            return;
+        }
+        if top.len() < k {
+            top.push((idx, score));
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            return;
+        }
+        let replace = match top.last() {
+            Some((_, tail_score)) => score > *tail_score,
+            None => true,
+        };
+        if replace {
+            top.pop();
+            top.push((idx, score));
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        }
+    }
+
+    fn normalized_temperature(config: &InferenceConfig) -> f32 {
+        if config.temperature <= 0.0 {
+            1.0
+        } else {
+            config.temperature
+        }
+    }
 }
 
+#[derive(Debug)]
 pub(crate) struct DecoderWorkspace {
     encoder_step: Array3<f32>,
     targets: Array2<i32>,
@@ -230,6 +510,27 @@ impl DecoderWorkspace {
     pub(crate) fn set_target(&mut self, token: i32) {
         self.targets[[0, 0]] = token;
     }
+
+    pub(crate) fn assign_state(
+        &mut self,
+        state1: ndarray::ArrayViewD<f32>,
+        state2: ndarray::ArrayViewD<f32>,
+    ) {
+        if let Ok(s1) = state1.into_dimensionality::<ndarray::Ix3>() {
+            if self.state.0.shape() == s1.shape() {
+                self.state.0.assign(&s1);
+            } else {
+                self.state.0 = s1.to_owned();
+            }
+        }
+        if let Ok(s2) = state2.into_dimensionality::<ndarray::Ix3>() {
+            if self.state.1.shape() == s2.shape() {
+                self.state.1.assign(&s2);
+            } else {
+                self.state.1 = s2.to_owned();
+            }
+        }
+    }
 }
 
 impl AsrModel {
@@ -261,7 +562,7 @@ impl AsrModel {
 
         let float_timestamps: Vec<f32> = timestamps
             .iter()
-            .map(|&t| WINDOW_SIZE * SUBSAMPLING_FACTOR as f32 * t as f32)
+            .map(|&t| FRAME_DURATION_SEC * t as f32)
             .collect();
 
         Transcript {
@@ -269,5 +570,38 @@ impl AsrModel {
             timestamps: float_timestamps,
             tokens,
         }
+    }
+}
+
+fn build_hotword_mask(model: &AsrModel, config: &InferenceConfig) -> Option<Vec<bool>> {
+    if config.hotword_boost <= 0.0 || config.hotwords.is_empty() {
+        return None;
+    }
+
+    let mut hotwords = HashSet::new();
+    for word in &config.hotwords {
+        let trimmed = word.trim();
+        if !trimmed.is_empty() {
+            hotwords.insert(trimmed.to_lowercase());
+        }
+    }
+    if hotwords.is_empty() {
+        return None;
+    }
+
+    let mut mask = vec![false; model.vocab.len()];
+    let mut matched = 0;
+    for (idx, token) in model.vocab.iter().enumerate() {
+        let normalized = token.trim().to_lowercase();
+        if hotwords.contains(&normalized) {
+            mask[idx] = true;
+            matched += 1;
+        }
+    }
+
+    if matched == 0 {
+        None
+    } else {
+        Some(mask)
     }
 }

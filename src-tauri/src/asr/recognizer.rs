@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use ndarray::{Array1, Array2, ArrayD, ArrayViewD, IxDyn};
+use ndarray::{Array1, ArrayD, ArrayView2, ArrayViewD, IxDyn};
 use num_cpus::get_physical;
 use ort::execution_providers::CPUExecutionProvider;
 use ort::inputs;
@@ -17,6 +17,17 @@ pub struct Transcript {
     pub text: String,
     pub timestamps: Vec<f32>,
     pub tokens: Vec<String>,
+}
+
+impl Transcript {
+    pub fn offset_timestamps(&mut self, offset_sec: f32) {
+        if offset_sec.abs() < f32::EPSILON {
+            return;
+        }
+        for timestamp in &mut self.timestamps {
+            *timestamp += offset_sec;
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -93,14 +104,91 @@ fn resolve_thread_count() -> usize {
 #[derive(Debug, Clone)]
 pub struct InferenceConfig {
     pub temperature: f32,
-    pub convert_timestamps: bool,
+    pub max_tokens_per_step: usize,
+    pub beam_width: usize,
+    pub min_blank_margin: f32,
+    pub hotword_boost: f32,
+    pub hotwords: Vec<String>,
 }
 
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            temperature: 1.0,
-            convert_timestamps: true,
+            temperature: 0.9,
+            max_tokens_per_step: 10,
+            beam_width: 1, // Default to greedy decoding for speed (beam search is too slow on CPU)
+            min_blank_margin: 0.0,
+            hotword_boost: 0.0,
+            hotwords: Vec::new(),
+        }
+    }
+}
+
+impl InferenceConfig {
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        config.apply_env_overrides("ASR_");
+        config
+    }
+
+    pub fn streaming_from_env() -> Self {
+        let mut config = Self::streaming_defaults();
+        config.apply_env_overrides("ASR_");
+        config.apply_env_overrides("STREAM_ASR_");
+        config
+    }
+
+    fn streaming_defaults() -> Self {
+        Self {
+            temperature: 0.85,
+            max_tokens_per_step: 8,
+            beam_width: 1,
+            min_blank_margin: 0.05,
+            hotword_boost: 0.0,
+            hotwords: Vec::new(),
+        }
+    }
+
+    fn apply_env_overrides(&mut self, prefix: &str) {
+        let temperature_key = format!("{prefix}TEMPERATURE");
+        if let Ok(value) = std::env::var(temperature_key) {
+            if let Ok(parsed) = value.parse::<f32>() {
+                self.temperature = parsed;
+            }
+        }
+        let max_tokens_key = format!("{prefix}MAX_TOKENS_PER_STEP");
+        if let Ok(value) = std::env::var(max_tokens_key) {
+            if let Ok(parsed) = value.parse::<usize>() {
+                self.max_tokens_per_step = parsed;
+            }
+        }
+        let beam_width_key = format!("{prefix}BEAM_WIDTH");
+        if let Ok(value) = std::env::var(beam_width_key) {
+            if let Ok(parsed) = value.parse::<usize>() {
+                self.beam_width = parsed.max(1);
+            }
+        }
+        let min_blank_key = format!("{prefix}MIN_BLANK_MARGIN");
+        if let Ok(value) = std::env::var(min_blank_key) {
+            if let Ok(parsed) = value.parse::<f32>() {
+                self.min_blank_margin = parsed;
+            }
+        }
+        let hotword_boost_key = format!("{prefix}HOTWORD_BOOST");
+        if let Ok(value) = std::env::var(hotword_boost_key) {
+            if let Ok(parsed) = value.parse::<f32>() {
+                self.hotword_boost = parsed;
+            }
+        }
+        let hotwords_key = format!("{prefix}HOTWORDS");
+        if let Ok(value) = std::env::var(hotwords_key) {
+            let words = value
+                .split(',')
+                .map(|w| w.trim())
+                .filter(|w| !w.is_empty())
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>();
+            self.hotwords = words;
         }
     }
 }
@@ -109,9 +197,9 @@ pub struct AsrModel {
     pub(super) encoder: Session,
     pub(super) decoder_joint: Session,
     pub(super) preprocessor: Session,
-    pub(super) vocab: Vec<String>,
-    pub(super) blank_idx: i32,
-    pub(super) vocab_size: usize,
+    pub vocab: Vec<String>,
+    pub blank_idx: i32,
+    pub vocab_size: usize,
     pub(super) cached_workspace: Option<crate::asr::decoder::DecoderWorkspace>,
     pub(super) cached_last_token: i32,
 }
@@ -256,12 +344,14 @@ impl AsrModel {
         Ok((vocab, blank_idx))
     }
 
-    fn preprocess(
+    pub fn preprocess(
         &mut self,
         waveforms: &ArrayViewD<f32>,
         waveforms_lens: &ArrayViewD<i64>,
     ) -> Result<(ArrayD<f32>, ArrayD<i64>), AsrError> {
         log::trace!("Running preprocessor inference...");
+        let waveforms = waveforms.as_standard_layout();
+        let waveforms_lens = waveforms_lens.as_standard_layout();
         let inputs = inputs![
             "waveforms" => TensorRef::from_array_view(waveforms.view())?,
             "waveforms_lens" => TensorRef::from_array_view(waveforms_lens.view())?,
@@ -282,12 +372,14 @@ impl AsrModel {
         Ok((features.to_owned(), features_lens.to_owned()))
     }
 
-    fn encode(
+    pub fn encode(
         &mut self,
         audio_signal: &ArrayViewD<f32>,
         length: &ArrayViewD<i64>,
     ) -> Result<(ArrayD<f32>, ArrayD<i64>), AsrError> {
         log::trace!("Running encoder inference...");
+        let audio_signal = audio_signal.as_standard_layout();
+        let length = length.as_standard_layout();
         let inputs = inputs![
             "audio_signal" => TensorRef::from_array_view(audio_signal.view())?,
             "length" => TensorRef::from_array_view(length.view())?,
@@ -328,13 +420,14 @@ impl AsrModel {
             self,
             cached_workspace,
             self.cached_last_token,
+            config,
         )?;
 
         let mut raw_results = Vec::new();
 
         for (encodings, &encodings_len) in encoder_out.outer_iter().zip(encoder_out_lens.iter()) {
             let (tokens, timestamps) =
-                session.decode_sequence(&encodings.view(), encodings_len as usize, config)?;
+                session.decode_sequence(self, &encodings.view(), encodings_len as usize, config)?;
             raw_results.push((tokens, timestamps));
         }
 
@@ -362,13 +455,22 @@ impl AsrModel {
         reuse_workspace: bool,
         config: Option<InferenceConfig>,
     ) -> Result<Transcript, AsrError> {
+        self.transcribe_samples_ref(&samples, reuse_workspace, config)
+    }
+
+    pub fn transcribe_samples_ref(
+        &mut self,
+        samples: &[f32],
+        reuse_workspace: bool,
+        config: Option<InferenceConfig>,
+    ) -> Result<Transcript, AsrError> {
         let batch_size = 1;
         let samples_len = samples.len();
 
         let rms: f32 = (samples.iter().map(|s| s * s).sum::<f32>() / samples_len as f32).sqrt();
         log::debug!("Transcription RMS: {:.4} (len: {})", rms, samples_len);
 
-        let audio = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
+        let audio = ArrayView2::from_shape((batch_size, samples_len), samples)?.into_dyn();
         let audio_lengths = Array1::from_vec(vec![samples_len as i64]).into_dyn();
 
         if !reuse_workspace {
@@ -378,7 +480,7 @@ impl AsrModel {
         }
 
         let config = config.unwrap_or_default();
-        let results = self.recognize_batch(&audio.view(), &audio_lengths.view(), &config)?;
+        let results = self.recognize_batch(&audio, &audio_lengths.view(), &config)?;
 
         let timestamped_result = results.into_iter().next().ok_or_else(|| {
             AsrError::Io(std::io::Error::new(

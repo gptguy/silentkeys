@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::{
     current_download_progress, default_model_root, record_failure, resolve_model_dir, AsrError,
-    AsrModel, DownloadProgress,
+    AsrModel, DownloadProgress, InferenceConfig, Transcript,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -35,6 +35,10 @@ impl SpeechEngine {
         };
         engine.spawn_idle_watcher();
         engine
+    }
+
+    pub fn get_model(&self) -> Arc<RwLock<Option<AsrModel>>> {
+        self.model.clone()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -183,37 +187,8 @@ impl SpeechEngine {
         samples: Vec<f32>,
         reuse_workspace: bool,
     ) -> Result<String, String> {
-        if samples.is_empty() {
-            return Err("No audio captured.".to_string());
-        }
-
-        log::debug!(
-            "transcribe_samples: samples={}, reuse_workspace={}",
-            samples.len(),
-            reuse_workspace
-        );
-
-        self.ensure_model_loaded()?;
-
-        let mut model_guard = self
-            .model
-            .write()
-            .map_err(|_| "Model lock poisoned".to_string())?;
-        let model: &mut AsrModel = model_guard
-            .as_mut()
-            .ok_or_else(|| "Speech model is not loaded yet. Please try again.".to_string())?;
-
-        self.update_last_use();
-
-        let start = Instant::now();
-        let result = model
-            .transcribe_samples(samples, reuse_workspace, None)
-            .map_err(|err| {
-                let msg = err.user_message().to_string();
-                log::error!("Transcription error: {}", msg);
-                log::debug!("Transcription error detail: {err}");
-                msg
-            })?;
+        let result =
+            self.transcribe_samples_inner(&samples, reuse_workspace, InferenceConfig::from_env())?;
 
         if !result.text.trim().is_empty() {
             let char_count = result.text.chars().count();
@@ -221,8 +196,16 @@ impl SpeechEngine {
             log::debug!("Transcript text: '{}'", result.text);
         }
 
-        log::debug!("Transcription took {:?}", start.elapsed());
         Ok(result.text)
+    }
+
+    pub fn transcribe_samples_with_config(
+        &self,
+        samples: &[f32],
+        reuse_workspace: bool,
+        config: &InferenceConfig,
+    ) -> Result<Transcript, String> {
+        self.transcribe_samples_inner(samples, reuse_workspace, config.clone())
     }
 
     pub fn reset_model_state(&self) {
@@ -247,5 +230,47 @@ impl SpeechEngine {
         let model = AsrModel::new(&model_dir, true)?;
         log::info!("ASR init took {:?}", start.elapsed());
         Ok(model)
+    }
+
+    fn transcribe_samples_inner(
+        &self,
+        samples: &[f32],
+        reuse_workspace: bool,
+        config: InferenceConfig,
+    ) -> Result<Transcript, String> {
+        if samples.is_empty() {
+            return Err("No audio captured.".to_string());
+        }
+
+        log::debug!(
+            "transcribe_samples: samples={}, reuse_workspace={}",
+            samples.len(),
+            reuse_workspace
+        );
+
+        self.ensure_model_loaded()?;
+
+        let mut model_guard = self
+            .model
+            .write()
+            .map_err(|_| "Model lock poisoned".to_string())?;
+        let model: &mut AsrModel = model_guard
+            .as_mut()
+            .ok_or_else(|| "Speech model is not loaded yet. Please try again.".to_string())?;
+
+        self.update_last_use();
+
+        let start = Instant::now();
+        let result = model
+            .transcribe_samples_ref(samples, reuse_workspace, Some(config))
+            .map_err(|err| {
+                let msg = err.user_message().to_string();
+                log::error!("Transcription error: {}", msg);
+                log::debug!("Transcription error detail: {err}");
+                msg
+            })?;
+
+        log::debug!("Transcription took {:?}", start.elapsed());
+        Ok(result)
     }
 }

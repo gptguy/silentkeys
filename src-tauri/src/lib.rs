@@ -2,6 +2,7 @@ pub mod asr;
 pub mod audio_processing;
 pub mod error;
 pub mod streaming;
+
 pub mod vad;
 
 pub mod app;

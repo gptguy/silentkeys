@@ -31,6 +31,13 @@ struct ModelDownloadProgressDto {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TranscriptionPatchDto {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
 async fn invoke_no_args(cmd: &str) -> Result<JsValue, String> {
     invoke(cmd, JsValue::NULL).await.map_err(extract_error)
 }
@@ -158,6 +165,23 @@ fn input_value(ev: &leptos::ev::Event) -> String {
         .unwrap_or_default()
 }
 
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    let total = text.chars().count();
+    if start >= total || start >= end {
+        return String::new();
+    }
+    let clamped_end = end.min(total);
+    text.chars().skip(start).take(clamped_end - start).collect()
+}
+
+fn apply_patch(current: &str, patch: &TranscriptionPatchDto) -> String {
+    let start = patch.start.min(patch.end);
+    let end = patch.end.max(patch.start);
+    let prefix = slice_chars(current, 0, start);
+    let suffix = slice_chars(current, end, usize::MAX);
+    format!("{prefix}{}{suffix}", patch.text)
+}
+
 fn start_model_progress_polling(
     is_recording: ReadSignal<bool>,
     transcribing: ReadSignal<bool>,
@@ -252,7 +276,6 @@ fn start_model_progress_polling(
         );
     }
 
-    // Leak the callback so the interval keeps running for the lifetime of the app.
     callback.forget();
 }
 
@@ -295,7 +318,7 @@ pub fn App() -> impl IntoView {
         if !is_recording.get() {
             set_status.set("Starting recording...".to_string());
             set_is_recording.set(true);
-            set_transcription.set(String::new()); // Clear for new recording
+            set_transcription.set(String::new());
             spawn_local(async move {
                 match start_recording_cmd().await {
                     Ok(_) => set_status.set("Recording... tap to stop.".to_string()),
@@ -312,7 +335,6 @@ pub fn App() -> impl IntoView {
             set_status.set("Stopping recording...".to_string());
             set_transcribing.set(true);
 
-            // In streaming mode, keep existing transcription; otherwise clear it
             let is_streaming = streaming_enabled.get_untracked();
             if !is_streaming {
                 set_transcription.set(String::new());
@@ -321,15 +343,7 @@ pub fn App() -> impl IntoView {
             match stop_recording_cmd().await {
                 Ok(text) => {
                     set_is_recording.set(false);
-                    // In streaming mode, append final text; otherwise replace
-                    if is_streaming && !text.trim().is_empty() {
-                        let current = transcription.get_untracked();
-                        if current.is_empty() {
-                            set_transcription.set(text);
-                        } else {
-                            set_transcription.set(format!("{} {}", current, text));
-                        }
-                    } else if !is_streaming {
+                    if !is_streaming {
                         set_transcription.set(text);
                     }
                     set_status.set("Finished.".to_string());
@@ -344,20 +358,25 @@ pub fn App() -> impl IntoView {
         });
     };
 
-    // Streaming event listener - accumulates phrases
     spawn_local(async move {
         let callback = Closure::wrap(Box::new(move |event: JsValue| {
             if let Ok(payload) = js_sys::Reflect::get(&event, &"payload".into()) {
-                if let Some(text) = payload.as_string() {
-                    if !text.trim().is_empty() {
-                        let current = transcription.get_untracked();
-                        if current.is_empty() {
-                            set_transcription.set(text);
-                        } else {
-                            set_transcription.set(format!("{} {}", current, text));
-                        }
-                    }
+                leptos::logging::log!("Received transcription_update event payload");
+                if let Ok(patch) = serde_wasm_bindgen::from_value::<TranscriptionPatchDto>(payload)
+                {
+                    let current = transcription.get_untracked();
+                    leptos::logging::log!(
+                        "Applying patch: text='{}' indices={}-{}",
+                        patch.text,
+                        patch.start,
+                        patch.end
+                    );
+                    set_transcription.set(apply_patch(&current, &patch));
+                } else {
+                    leptos::logging::warn!("Unexpected transcription payload; expected patch");
                 }
+            } else {
+                leptos::logging::warn!("Received event without payload");
             }
         }) as Box<dyn FnMut(JsValue)>);
 
@@ -367,7 +386,6 @@ pub fn App() -> impl IntoView {
         callback.forget();
     });
 
-    // Check model readiness and load persisted shortcut or default on startup
     {
         start_model_progress_polling(
             is_recording,
@@ -428,14 +446,13 @@ pub fn App() -> impl IntoView {
                         }
                         Err(e) => set_status.set(format!("Failed to save path: {}", e)),
                     },
-                    Ok(None) => {} // User cancelled
+                    Ok(None) => {}
                     Err(e) => set_status.set(format!("Failed to pick folder: {}", e)),
                 }
             });
         }
     };
 
-    // Fetch initial model path and settings
     {
         spawn_local(async move {
             if let Ok(path) = fetch_model_path().await {
@@ -470,7 +487,6 @@ pub fn App() -> impl IntoView {
             spawn_local(async move {
                 match reset_settings_cmd().await {
                     Ok(_) => {
-                        // Refresh UI with new defaults
                         if let Ok(path) = fetch_model_path().await {
                             set_model_path.set(path);
                         }

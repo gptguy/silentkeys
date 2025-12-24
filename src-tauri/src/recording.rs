@@ -13,7 +13,7 @@ use rtrb::{Producer, RingBuffer};
 use thiserror::Error;
 
 use crate::asr::TARGET_SAMPLE_RATE;
-use crate::audio_processing::{AudioProcessor, ProcessingEvent};
+use crate::audio_processing::{AudioFrame, AudioProcessor};
 
 #[derive(Error, Debug, Clone)]
 pub enum RecordingError {
@@ -35,7 +35,7 @@ pub enum RecordingError {
     ChannelError,
     #[error("Audio thread panicked or failed to start")]
     ThreadError,
-    #[error("VAD error: {0}")]
+    #[error("Audio processing error: {0}")]
     VadError(String),
 }
 
@@ -52,7 +52,7 @@ impl RecordingError {
             Self::ChannelError | Self::ThreadError => {
                 "Internal audio error. Please restart the app."
             }
-            Self::VadError(_) => "Voice detection error. Please restart.",
+            Self::VadError(_) => "Audio processing error. Please restart.",
         }
     }
 }
@@ -103,6 +103,7 @@ enum AudioCmd {
 pub struct Recorder {
     is_recording: AtomicBool,
     processed_samples: Arc<Mutex<Vec<f32>>>,
+    streamed_any: AtomicBool,
     cmd_tx: Mutex<Option<Sender<AudioCmd>>>,
     worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
     pub overrun_count: Arc<AtomicUsize>,
@@ -113,6 +114,7 @@ impl Recorder {
         Self {
             is_recording: AtomicBool::new(false),
             processed_samples: Arc::new(Mutex::new(Vec::new())),
+            streamed_any: AtomicBool::new(false),
             cmd_tx: Mutex::new(None),
             worker_handle: Mutex::new(None),
             overrun_count: Arc::new(AtomicUsize::new(0)),
@@ -128,11 +130,7 @@ impl Recorder {
         self.is_recording.load(Ordering::SeqCst)
     }
 
-    pub fn start(
-        &self,
-        vad_model_path: &std::path::Path,
-        streaming_tx: Option<Sender<ProcessingEvent>>,
-    ) -> Result<(), RecordingError> {
+    pub fn start(&self, streaming_tx: Option<Sender<AudioFrame>>) -> Result<(), RecordingError> {
         if self
             .is_recording
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -144,6 +142,7 @@ impl Recorder {
         if let Ok(mut guard) = self.processed_samples.lock() {
             guard.clear();
         }
+        self.streamed_any.store(false, Ordering::Relaxed);
         self.overrun_count.store(0, Ordering::Relaxed);
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -151,14 +150,11 @@ impl Recorder {
 
         let processed_samples_clone = self.processed_samples.clone();
         let overrun_clone = self.overrun_count.clone();
-        let model_path = vad_model_path.to_path_buf();
-
         let handle = thread::spawn(move || {
             let res = init_and_run_audio_thread(
                 cmd_rx,
                 processed_samples_clone,
                 init_tx,
-                &model_path,
                 streaming_tx,
                 overrun_clone,
             );
@@ -238,14 +234,21 @@ impl Recorder {
 
         Ok(samples)
     }
+
+    pub fn mark_streamed_any(&self) {
+        self.streamed_any.store(true, Ordering::Relaxed);
+    }
+
+    pub fn streamed_any(&self) -> bool {
+        self.streamed_any.load(Ordering::Relaxed)
+    }
 }
 
 fn init_and_run_audio_thread(
     cmd_rx: Receiver<AudioCmd>,
     processed_samples: Arc<Mutex<Vec<f32>>>,
     init_tx: Sender<Result<(), RecordingError>>,
-    vad_model_path: &std::path::Path,
-    streaming_tx: Option<Sender<ProcessingEvent>>,
+    streaming_tx: Option<Sender<AudioFrame>>,
     overrun_count: Arc<AtomicUsize>,
 ) -> Result<(), RecordingError> {
     fn send_init_err(
@@ -268,6 +271,7 @@ fn init_and_run_audio_thread(
         }
     };
 
+    #[allow(deprecated)]
     let device_name = device
         .name()
         .unwrap_or_else(|_| "Unknown input device".to_string());
@@ -285,7 +289,7 @@ fn init_and_run_audio_thread(
 
     let stream_config = default_config;
 
-    let sample_rate = stream_config.sample_rate().0;
+    let sample_rate = stream_config.sample_rate();
     let channels = stream_config.channels() as usize;
 
     log::info!("Audio Config: {} Hz, {} channels", sample_rate, channels);
@@ -334,39 +338,26 @@ fn init_and_run_audio_thread(
         .send(Ok(()))
         .map_err(|_| RecordingError::ChannelError)?;
 
-    let mut processor = AudioProcessor::new(
-        sample_rate as usize,
-        TARGET_SAMPLE_RATE as usize,
-        vad_model_path,
-    )
-    .map_err(|e| RecordingError::VadError(e.to_string()))?;
+    let mut processor = AudioProcessor::new(sample_rate as usize, TARGET_SAMPLE_RATE as usize)
+        .map_err(|e| RecordingError::VadError(e.to_string()))?;
 
     const PROCESS_CHUNK_SIZE: usize = 480;
-    let mut scratch_buf = vec![0.0f32; PROCESS_CHUNK_SIZE * 2];
+    const MAX_READ_SAMPLES: usize = PROCESS_CHUNK_SIZE * 8;
     let mut stopping = false;
 
-    let mut dispatch_event = |event: ProcessingEvent| match event {
-        ProcessingEvent::SpeechStart(chunk) => {
-            if let Ok(mut guard) = processed_samples.lock() {
-                guard.extend_from_slice(&chunk);
-            }
-            if let Some(tx) = &streaming_tx {
-                let _ = tx.send(ProcessingEvent::SpeechStart(chunk));
-            }
-        }
-        ProcessingEvent::Speech(chunk) => {
-            if let Ok(mut guard) = processed_samples.lock() {
-                guard.extend_from_slice(&chunk);
-            }
-            if let Some(tx) = &streaming_tx {
-                let _ = tx.send(ProcessingEvent::Speech(chunk));
+    let mut processed_local: Vec<f32> = Vec::new();
+
+    let send_stream_event = |frame: AudioFrame| {
+        if let Some(tx) = &streaming_tx {
+            if let Err(err) = tx.send(frame) {
+                log::warn!("Streaming channel closed, dropping event: {err:?}");
             }
         }
-        ProcessingEvent::SpeechEnd => {
-            if let Some(tx) = &streaming_tx {
-                let _ = tx.send(ProcessingEvent::SpeechEnd);
-            }
-        }
+    };
+
+    let mut dispatch_event = |frame: AudioFrame| {
+        processed_local.extend_from_slice(&frame.samples);
+        send_stream_event(frame);
     };
 
     'consumer_loop: loop {
@@ -379,44 +370,44 @@ fn init_and_run_audio_thread(
             }
         }
 
-        let available = consumer.slots();
+        let mut available = consumer.slots();
 
         if available >= PROCESS_CHUNK_SIZE {
-            let to_read = (available / PROCESS_CHUNK_SIZE) * PROCESS_CHUNK_SIZE;
-            let to_read = to_read.min(scratch_buf.len());
+            while available >= PROCESS_CHUNK_SIZE {
+                let mut to_read = (available / PROCESS_CHUNK_SIZE) * PROCESS_CHUNK_SIZE;
+                to_read = to_read.min(MAX_READ_SAMPLES);
 
-            if let Ok(chunk) = consumer.read_chunk(to_read) {
-                let (first, second) = chunk.as_slices();
+                if let Ok(chunk) = consumer.read_chunk(to_read) {
+                    let (first, second) = chunk.as_slices();
 
-                let first_len = first.len();
-                scratch_buf[..first_len].copy_from_slice(first);
-                if !second.is_empty() {
-                    scratch_buf[first_len..first_len + second.len()].copy_from_slice(second);
+                    if let Err(e) = processor.process(first, &mut dispatch_event) {
+                        log::error!("Processing error: {:?}", e);
+                    }
+                    if !second.is_empty() {
+                        if let Err(e) = processor.process(second, &mut dispatch_event) {
+                            log::error!("Processing error: {:?}", e);
+                        }
+                    }
+
+                    chunk.commit_all();
                 }
-                let total_read = first_len + second.len();
-                chunk.commit_all();
 
-                let data = &scratch_buf[..total_read];
-
-                if let Err(e) = processor.process(data, &mut dispatch_event) {
-                    log::error!("Processing error: {:?}", e);
-                }
+                available = consumer.slots();
             }
         } else if available > 0 {
             if let Ok(chunk) = consumer.read_chunk(available) {
                 let (first, second) = chunk.as_slices();
-                let first_len = first.len();
-                scratch_buf[..first_len].copy_from_slice(first);
-                if !second.is_empty() {
-                    scratch_buf[first_len..first_len + second.len()].copy_from_slice(second);
-                }
-                let total_read = first_len + second.len();
-                chunk.commit_all();
 
-                let data = &scratch_buf[..total_read];
-                if let Err(e) = processor.process(data, &mut dispatch_event) {
+                if let Err(e) = processor.process(first, &mut dispatch_event) {
                     log::error!("Processing error: {:?}", e);
                 }
+                if !second.is_empty() {
+                    if let Err(e) = processor.process(second, &mut dispatch_event) {
+                        log::error!("Processing error: {:?}", e);
+                    }
+                }
+
+                chunk.commit_all();
             }
         } else if stopping {
             break 'consumer_loop;
@@ -427,6 +418,10 @@ fn init_and_run_audio_thread(
 
     if let Err(e) = processor.flush(&mut dispatch_event) {
         log::error!("Processing flush error: {:?}", e);
+    }
+
+    if let Ok(mut guard) = processed_samples.lock() {
+        *guard = processed_local;
     }
 
     let overruns = overrun_count.load(Ordering::Relaxed);

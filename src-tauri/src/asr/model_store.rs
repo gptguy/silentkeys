@@ -83,7 +83,7 @@ fn download_missing_files(snapshot_dir: &Path, missing_files: &[String]) -> Resu
     }
 }
 
-pub fn vad_model_path(app: &AppHandle) -> PathBuf {
+fn vad_model_path(app: &AppHandle) -> PathBuf {
     let root = default_model_root(app);
     root.join("snapshots")
         .join("downloaded")
@@ -296,10 +296,10 @@ fn download_asset(url: &str, dest: &Path) -> Result<(), AsrError> {
     let tmp = dest.with_extension("download");
     let mut last_err: Option<AsrError> = None;
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(30))
+    let config = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(30)))
         .build();
+    let agent = ureq::Agent::new_with_config(config);
 
     for attempt in 1..=MAX_RETRIES {
         log::info!(
@@ -345,17 +345,15 @@ fn try_download_resumable(
     tmp: &Path,
     dest: &Path,
 ) -> Result<(), AsrError> {
-    // 1. Check current size of tmp file
     let current_len = if tmp.exists() {
         fs::metadata(tmp).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
 
-    // 2. Make Request
     let mut request = agent.get(url);
     if current_len > 0 {
-        request = request.set("Range", &format!("bytes={}-", current_len));
+        request = request.header("Range", &format!("bytes={}-", current_len));
     }
 
     let response = request
@@ -363,25 +361,26 @@ fn try_download_resumable(
         .map_err(|e| AsrError::Download(format!("{url}: request failed: {e}")))?;
 
     let status = response.status();
-    // ureq returns success for 2xx.
-    if !(200..300).contains(&status) {
+    if !(200..300).contains(&status.as_u16()) {
         return Err(AsrError::Download(format!(
             "{url}: unexpected status {status}"
         )));
     }
-
-    // 3. Handle Response
     let total_size = if status == 206 {
         // Partial Content
         let content_len = response
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         current_len + content_len
     } else {
         // If server didn't respect Range (returned 200), we overwrite
         response
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     };
@@ -402,7 +401,7 @@ fn try_download_resumable(
     let mut downloaded = if status == 206 { current_len } else { 0 };
     let mut buffer = [0; 8192];
 
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     loop {
         let bytes_read = reader
             .read(&mut buffer)

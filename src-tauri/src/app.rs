@@ -51,8 +51,15 @@ pub fn run() {
             commands::set_use_streaming,
             commands::reset_settings
         ])
-        .build(context)
-        .expect("error while running tauri application");
+        .build(context);
+
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            log::error!("error while running tauri application: {err}");
+            return;
+        }
+    };
 
     app.run(handle_run_event);
 }

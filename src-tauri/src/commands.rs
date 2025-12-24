@@ -75,9 +75,6 @@ pub fn start_recording(app: AppHandle) -> Result<(), String> {
     log::info!("Tauri command start_recording invoked");
 
     let streaming = crate::settings::get_settings(&app).streaming_enabled;
-
-    let vad_path = crate::asr::get_or_init_vad_model(&app)?;
-
     let engine = app.state::<SpeechEngine>();
     engine.reset_model_state();
 
@@ -85,24 +82,36 @@ pub fn start_recording(app: AppHandle) -> Result<(), String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let app_handle = app.clone();
 
-        log::info!("Starting streaming thread");
-        std::thread::spawn(move || {
-            let state = app_handle.state::<SpeechEngine>();
-            crate::streaming::process_streaming_loop(rx, &state, |text| {
-                log::debug!(
-                    "UI streaming: emitting transcription (len={} chars)",
-                    text.len()
-                );
-                let _ = app_handle.emit("transcription_update", text);
-            });
+        // We get the model path from settings or default
+        let model_root = crate::asr::default_model_root(&app);
+        let model_path = crate::asr::resolve_model_dir(&model_root).map_err(|e| e.to_string())?;
+
+        log::info!("Starting streaming pipeline with model: {:?}", model_path);
+
+        let pipeline = std::sync::Arc::new(crate::streaming::StreamingPipeline::new());
+        let emit_handle = app_handle.clone();
+        let engine_state = app_handle.state::<SpeechEngine>().clone();
+
+        pipeline.start(rx, engine_state.get_model(), move |patch| {
+            if !patch.text.is_empty() {
+                Recorder::global().mark_streamed_any();
+            }
+
+            if !patch.stable {
+                log::debug!("Sending UI event, len={}", patch.text.len());
+                if let Err(e) = emit_handle.emit("transcription_update", patch) {
+                    log::error!("Failed to emit transcription_update: {}", e);
+                }
+            }
         });
+
         Some(tx)
     } else {
         None
     };
 
     Recorder::global()
-        .start(&vad_path, streaming_tx)
+        .start(streaming_tx)
         .map_err(|e| e.user_message().to_string())?;
 
     log::info!("Recorder started (Streaming={})", streaming);
@@ -122,6 +131,22 @@ pub fn stop_recording(app: AppHandle, state: State<'_, SpeechEngine>) -> Result<
             "Streaming mode: {} samples remaining (drained during recording)",
             samples.len()
         );
+        if !Recorder::global().streamed_any() {
+            let text = state.transcribe_samples(samples, false)?;
+            log::debug!(
+                "Stop recording (streaming): leftover text len={}",
+                text.len()
+            );
+            if !text.trim().is_empty() {
+                let patch = crate::streaming::TranscriptionPatch {
+                    start: 0,
+                    end: u32::MAX as usize,
+                    text,
+                    stable: true,
+                };
+                let _ = app.emit("transcription_update", patch);
+            }
+        }
         return Ok(String::new());
     }
 
