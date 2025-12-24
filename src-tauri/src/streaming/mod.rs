@@ -1,8 +1,7 @@
 pub mod decoding;
-pub mod hypothesis;
 pub mod pipeline;
-pub mod word_aggregation;
 pub mod word_hypothesis;
+pub mod words;
 
 pub use pipeline::StreamingPipeline;
 

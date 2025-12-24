@@ -1,28 +1,31 @@
-use silent_keys_lib::recording::*;
+use cpal::Sample;
+use silent_keys_lib::recording::RecordingError;
 
 #[test]
 fn i8_normalization() {
-    assert!((i8::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-    assert!((0i8.to_normalized()).abs() < f32::EPSILON);
-    assert!(((-64i8).to_normalized() - (-0.5)).abs() < 0.01);
+    assert!((Sample::to_sample::<f32>(i8::MAX) - 0.9921875).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(0i8)).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(-64i8) - (-0.5)).abs() < f32::EPSILON);
 }
 
 #[test]
 fn i16_normalization() {
-    assert!((i16::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-    assert!((0i16.to_normalized()).abs() < f32::EPSILON);
+    let val = Sample::to_sample::<f32>(i16::MAX);
+    assert!((val - (32767.0 / 32768.0)).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(0i16)).abs() < f32::EPSILON);
 }
 
 #[test]
 fn i32_normalization() {
-    assert!((i32::MAX.to_normalized() - 1.0).abs() < f32::EPSILON);
-    assert!((0i32.to_normalized()).abs() < f32::EPSILON);
+    let val = Sample::to_sample::<f32>(i32::MAX);
+    assert!((val - (i32::MAX as f32 / 2147483648.0)).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(0i32)).abs() < f32::EPSILON);
 }
 
 #[test]
 fn f32_passthrough() {
-    assert!((0.5f32.to_normalized() - 0.5).abs() < f32::EPSILON);
-    assert!((-1.0f32.to_normalized() - (-1.0)).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(0.5f32) - 0.5).abs() < f32::EPSILON);
+    assert!((Sample::to_sample::<f32>(-1.0f32) - (-1.0)).abs() < f32::EPSILON);
 }
 
 #[test]

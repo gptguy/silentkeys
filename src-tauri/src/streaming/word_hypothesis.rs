@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::streaming::hypothesis::WordWithTime;
+use crate::streaming::words::{longest_stable_prefix, words_to_text, WordWithTime};
 
 pub struct WordHypothesisConfig {
     pub history_size: usize,
@@ -13,11 +13,11 @@ pub struct WordHypothesisConfig {
 impl Default for WordHypothesisConfig {
     fn default() -> Self {
         Self {
-            history_size: 4,
+            history_size: 3,
             commit_lag_ms: 50,
             time_bucket_ms: 100,
             safety_margin_words: 0,
-            max_uncommitted_duration_ms: 4000,
+            max_uncommitted_duration_ms: 1500,
         }
     }
 }
@@ -27,7 +27,8 @@ pub struct WordHypothesisManager {
     committed: Vec<WordWithTime>,
     current_draft: Vec<WordWithTime>,
     history: VecDeque<Vec<WordWithTime>>,
-    emitted_committed_len: usize,
+    pub stable_char_len: usize,
+    pub total_char_len: usize,
 }
 
 impl WordHypothesisManager {
@@ -37,7 +38,8 @@ impl WordHypothesisManager {
             committed: Vec::new(),
             current_draft: Vec::new(),
             history: VecDeque::new(),
-            emitted_committed_len: 0,
+            stable_char_len: 0,
+            total_char_len: 0,
         }
     }
 
@@ -46,7 +48,12 @@ impl WordHypothesisManager {
         new_words: Vec<WordWithTime>,
         current_audio_ms: i64,
     ) -> Option<(usize, i32)> {
-        self.current_draft = new_words;
+        // Filter out words that have already been committed based on time
+        let last_committed_t1 = self.committed.last().map(|w| w.t1_ms).unwrap_or(-1);
+        self.current_draft = new_words
+            .into_iter()
+            .filter(|w| w.t0_ms >= last_committed_t1)
+            .collect();
 
         log::debug!("Draft after update: {} words", self.current_draft.len());
 
@@ -55,7 +62,7 @@ impl WordHypothesisManager {
             self.history.pop_front();
         }
 
-        let stable_prefix = if self.history.len() >= 3 {
+        let stable_prefix = if self.history.len() >= self.config.history_size {
             longest_stable_prefix(&self.history, self.config.time_bucket_ms)
         } else {
             Vec::new()
@@ -68,10 +75,7 @@ impl WordHypothesisManager {
             .or_else(|| self.check_force_commit(current_audio_ms));
 
         if let Some(to_commit) = words_to_commit {
-            let last = match to_commit.last() {
-                Some(last) => last,
-                None => return None,
-            };
+            let last = to_commit.last()?;
             let commit_boundary_ms = last.t1_ms;
             let commit_frame = last.end_frame;
             let commit_token = last.last_token_id;
@@ -91,6 +95,7 @@ impl WordHypothesisManager {
                 draft.retain(|w| w.t0_ms > commit_boundary_ms);
             }
 
+            self.total_char_len = self.get_full_text().chars().count();
             return Some((commit_frame, commit_token));
         }
 
@@ -152,18 +157,15 @@ impl WordHypothesisManager {
         words_to_text(&self.committed, &self.current_draft)
     }
 
-    pub fn take_newly_committed(&mut self) -> Option<String> {
+    pub fn take_newly_committed(&mut self) -> Option<(usize, String)> {
         let committed_text = words_to_text(&self.committed, &[]);
         let committed_chars: Vec<char> = committed_text.chars().collect();
 
-        if committed_chars.len() > self.emitted_committed_len {
-            let new_text: String = committed_chars[self.emitted_committed_len..]
-                .iter()
-                .collect();
-            self.emitted_committed_len = committed_chars.len();
-            if !new_text.trim().is_empty() {
-                return Some(new_text);
-            }
+        if committed_chars.len() > self.stable_char_len {
+            let new_text: String = committed_chars[self.stable_char_len..].iter().collect();
+            let start = self.stable_char_len;
+            self.stable_char_len = committed_chars.len();
+            return Some((start, new_text));
         }
         None
     }
@@ -171,49 +173,4 @@ impl WordHypothesisManager {
     pub fn get_draft_only_text(&self) -> String {
         words_to_text(&[], &self.current_draft)
     }
-}
-
-fn longest_stable_prefix(
-    history: &VecDeque<Vec<WordWithTime>>,
-    bucket_ms: i64,
-) -> Vec<WordWithTime> {
-    if history.is_empty() {
-        return Vec::new();
-    }
-
-    let first = &history[0];
-    let mut stable = Vec::new();
-
-    'outer: for (i, word) in first.iter().enumerate() {
-        for draft in history.iter().skip(1) {
-            if i >= draft.len() {
-                break 'outer;
-            }
-
-            let other = &draft[i];
-
-            if !word.matches_in_time_bucket(other, bucket_ms) {
-                break 'outer;
-            }
-        }
-
-        stable.push(word.clone());
-    }
-
-    stable
-}
-
-fn words_to_text(committed: &[WordWithTime], draft: &[WordWithTime]) -> String {
-    let mut result = String::new();
-    let mut first = true;
-
-    for word in committed.iter().chain(draft.iter()) {
-        if !first {
-            result.push(' ');
-        }
-        result.push_str(&word.text);
-        first = false;
-    }
-
-    result
 }

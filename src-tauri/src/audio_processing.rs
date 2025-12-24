@@ -1,11 +1,18 @@
-use crate::error::AudioError;
-use crate::vad::VAD_CHUNK_SIZE;
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::collections::VecDeque;
 
-const RESAMPLER_CHUNK_OUT: usize = VAD_CHUNK_SIZE; // 480
+pub const PROCESS_CHUNK_SIZE: usize = 480;
+const RESAMPLER_CHUNK_OUT: usize = PROCESS_CHUNK_SIZE;
+
+#[derive(thiserror::Error, Debug)]
+pub enum AudioError {
+    #[error("Failed to create resampler: {0}")]
+    ResamplerCreation(String),
+    #[error("Resampler processing failed: {0}")]
+    ResamplerProcessing(String),
+}
 
 #[derive(Debug)]
 pub struct AudioFrame {
@@ -20,10 +27,7 @@ pub struct AudioProcessor {
 }
 
 impl AudioProcessor {
-    pub fn new(
-        in_sample_rate: usize,
-        out_sample_rate: usize,
-    ) -> Result<Self, AudioError> {
+    pub fn new(in_sample_rate: usize, out_sample_rate: usize) -> Result<Self, AudioError> {
         let resampler = if in_sample_rate != out_sample_rate {
             let params = SincInterpolationParameters {
                 sinc_len: 256,
@@ -61,7 +65,7 @@ impl AudioProcessor {
             resampler,
             buffer: VecDeque::with_capacity(4096),
             scratch_in: Vec::with_capacity(2048),
-            scratch_out: Vec::with_capacity(VAD_CHUNK_SIZE),
+            scratch_out: Vec::with_capacity(PROCESS_CHUNK_SIZE),
         })
     }
 
@@ -98,17 +102,17 @@ impl AudioProcessor {
                 } else {
                     break;
                 }
-            } else if self.buffer.len() >= VAD_CHUNK_SIZE {
+            } else if self.buffer.len() >= PROCESS_CHUNK_SIZE {
                 let mut scratch = std::mem::take(&mut self.scratch_out);
                 scratch.clear();
                 let (front, back) = self.buffer.as_slices();
-                let front_take = front.len().min(VAD_CHUNK_SIZE);
+                let front_take = front.len().min(PROCESS_CHUNK_SIZE);
                 scratch.extend_from_slice(&front[..front_take]);
-                if front_take < VAD_CHUNK_SIZE && !back.is_empty() {
-                    let back_take = (VAD_CHUNK_SIZE - front_take).min(back.len());
+                if front_take < PROCESS_CHUNK_SIZE && !back.is_empty() {
+                    let back_take = (PROCESS_CHUNK_SIZE - front_take).min(back.len());
                     scratch.extend_from_slice(&back[..back_take]);
                 }
-                self.buffer.drain(..VAD_CHUNK_SIZE);
+                self.buffer.drain(..PROCESS_CHUNK_SIZE);
 
                 let frame = scratch.clone();
                 if !frame.is_empty() {

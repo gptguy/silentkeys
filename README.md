@@ -87,7 +87,7 @@ The speech engine uses Parakeet models via ONNX Runtime embedded in a Rust core.
 1. **Global Hook**: A lightweight Rust daemon listens for the configurable push-to-talk shortcut.
 2. **Audio Capture**: Captures high-fidelity audio from the system microphone using low-latency buffers.
 3. **Inference**: Audio chunks are processed by the Parakeet model via ONNX Runtime.
-4. **Streaming**: Silero VAD detects phrase boundaries to stream accurate partial transcripts.
+4. **Streaming**: Partial transcripts are streamed while audio is captured.
 5. **Virtual Typing**: The `Enigo` crate drives virtual keypresses to insert text into the focused window.
 
 ---
@@ -129,8 +129,8 @@ The bundled application will be available at:
 ### Configuration
 Preferences can be accessed via the UI to configure:
 - **Global Shortcut**: Customize the hotkey.
-- **Streaming Mode**: Toggle real-time text visualization (uses Silero VAD for phrase detection).
-- **Model Path**: Manage the location of the ONNX model files (VAD model is auto-downloaded here).
+- **Streaming Mode**: Toggle real-time text visualization.
+- **Model Path**: Manage the location of the ONNX model files.
 
 ---
 
@@ -158,7 +158,7 @@ cargo tauri build
 ## 🛠️ Roadmap
 
 **Core**
-- [x] Improve streaming behavior (VAD-based sequencing).
+- [x] Improve streaming behavior (partial stability + buffering).
 - [ ] Add local-only crash reporting (opt-in).
 
 **Performance**

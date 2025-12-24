@@ -1,7 +1,7 @@
-use silent_keys_lib::asr::download_progress::{
+use silent_keys_lib::asr::{
     current_download_progress, mark_finished, record_failure, set_file_index, start_tracking,
+    AsrError, Transcript,
 };
-use silent_keys_lib::asr::{AsrError, Transcript};
 
 #[test]
 fn download_progress_lifecycle_is_coherent() {

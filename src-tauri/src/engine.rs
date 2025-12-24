@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::{
     current_download_progress, default_model_root, record_failure, resolve_model_dir, AsrError,
-    AsrModel, DownloadProgress, InferenceConfig, Transcript,
+    AsrModel, DownloadProgress, InferenceConfig,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -59,124 +59,97 @@ impl SpeechEngine {
     }
 
     pub fn retry_model_download(&self) -> Result<(), String> {
+        if let Ok(mut status) = self.status.lock() {
+            if matches!(*status, EngineState::Failed(_)) {
+                *status = EngineState::Unloaded;
+            }
+        }
         self.ensure_model_loaded()
     }
 
     pub fn ensure_model_loaded(&self) -> Result<(), String> {
         self.update_last_use();
 
-        let mut status = self
-            .status
-            .lock()
-            .map_err(|_| "Status lock poisoned".to_string())?;
-        match *status {
-            EngineState::Loaded => return Ok(()),
-            EngineState::Failed(ref e) => {
-                log::warn!("Previous load failed: {}. Retrying...", e);
-                *status = EngineState::Unloaded;
-            }
-            EngineState::Loading => {
-                log::debug!("Waiting for model load...");
-                let result = self
-                    .status_cv
-                    .wait_timeout(status, Duration::from_secs(30))
-                    .map_err(|_| "Status lock poisoned during wait".to_string())?;
-                status = result.0;
-                if result.1.timed_out() {
-                    return Err("Model load timed out".to_string());
-                }
-                match *status {
-                    EngineState::Loaded => return Ok(()),
-                    EngineState::Failed(ref e) => return Err(e.clone()),
-                    _ => return Err("Model load state invalid after wait".to_string()),
-                }
-            }
-            EngineState::Unloaded => {}
-        }
-
-        *status = EngineState::Loading;
-        drop(status);
-
-        let app_handle = self.app_handle.clone().ok_or("No app handle")?;
-        let model_safe = self.model.clone();
-        let status_safe = self.status.clone();
-        let cv_safe = self.status_cv.clone();
-
-        let _ = app_handle.emit("model_status", "loading");
-
-        std::thread::spawn(move || match Self::init_model(&app_handle) {
-            Ok(loaded_model) => {
-                let Ok(mut model_guard) = model_safe.write() else {
-                    log::error!("Model lock poisoned during load");
-                    return;
-                };
-                *model_guard = Some(loaded_model);
-                drop(model_guard);
-
-                let Ok(mut s) = status_safe.lock() else {
-                    log::error!("Status lock poisoned after load");
-                    return;
-                };
-                *s = EngineState::Loaded;
-                log::info!("Model loaded successfully");
-                let _ = app_handle.emit("model_status", "loaded");
-                cv_safe.notify_all();
-            }
-            Err(e) => {
-                let msg = e.user_message().to_string();
-                log::error!("Load failed: {msg} ({e})");
-                record_failure(msg.clone());
-                if let Ok(mut s) = status_safe.lock() {
-                    *s = EngineState::Failed(msg);
-                }
-                cv_safe.notify_all();
-            }
-        });
-
-        let mut status = self
-            .status
-            .lock()
-            .map_err(|_| "Status lock poisoned".to_string())?;
         loop {
+            let mut status = self
+                .status
+                .lock()
+                .map_err(|_| "Status lock poisoned".to_string())?;
             match *status {
                 EngineState::Loaded => return Ok(()),
-                EngineState::Failed(ref e) => return Err(e.clone()),
+                EngineState::Unloaded => {
+                    if matches!(*status, EngineState::Loading) {
+                        return Ok(());
+                    }
+                    *status = EngineState::Loading;
+                    drop(status);
+
+                    let app_handle = self.app_handle.clone();
+                    let model_arc = self.model.clone();
+                    let state_arc = self.status.clone();
+                    let condvar = self.status_cv.clone();
+
+                    let app_emitter = app_handle.clone().ok_or("No app handle")?;
+                    let _ = app_emitter.emit("model_status", "loading");
+
+                    std::thread::spawn(move || {
+                        match Self::init_model(&app_handle.unwrap()) {
+                            Ok(model) => {
+                                if let Ok(mut m) = model_arc.write() {
+                                    *m = Some(model);
+                                }
+                                if let Ok(mut s) = state_arc.lock() {
+                                    *s = EngineState::Loaded;
+                                }
+                                let _ = app_emitter.emit("model_status", "loaded");
+                            }
+                            Err(e) => {
+                                let msg = e.user_message().to_string();
+                                log::error!("Load failed: {msg}");
+                                record_failure(msg.clone());
+                                if let Ok(mut s) = state_arc.lock() {
+                                    *s = EngineState::Failed(msg);
+                                }
+                            }
+                        }
+                        condvar.notify_all();
+                    });
+                }
                 EngineState::Loading => {
-                    let result = self
+                    let (_s, res) = self
                         .status_cv
                         .wait_timeout(status, Duration::from_secs(30))
-                        .map_err(|_| "Status lock poisoned during wait".to_string())?;
-                    status = result.0;
-                    if result.1.timed_out() {
-                        return Err("Model load timed out".to_string());
+                        .map_err(|_| "Wait timeout poisoned")?;
+                    if res.timed_out() {
+                        return Err("Model load failed: timeout".to_string());
                     }
                 }
-                _ => return Err("Unexpected state during load".to_string()),
+                EngineState::Failed(_) => {
+                    *status = EngineState::Unloaded;
+                }
             }
         }
     }
 
     fn spawn_idle_watcher(&self) {
-        let last_use = self.last_use.clone();
-        let model = self.model.clone();
-        let status = self.status.clone();
-
+        let (last_use, model, status) = (
+            self.last_use.clone(),
+            self.model.clone(),
+            self.status.clone(),
+        );
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(60));
-            let elapsed = match last_use.lock() {
-                Ok(guard) => guard.elapsed(),
-                Err(_) => continue,
-            };
-            if elapsed.as_secs() > 300 {
-                let Ok(mut status_guard) = status.lock() else {
-                    continue;
-                };
-                if matches!(*status_guard, EngineState::Loaded) {
-                    log::info!("Unloading idle ASR model after {:?}", elapsed);
-                    if let Ok(mut m) = model.write() {
-                        *m = None;
+            if let Ok(last) = last_use.lock() {
+                if last.elapsed().as_secs() > 300 {
+                    if let Ok(mut status_guard) = status.lock() {
+                        if matches!(*status_guard, EngineState::Loaded) {
+                            log::info!("Unloading idle ASR model");
+                            if let Ok(mut m) = model.write() {
+                                *m = None;
+                            }
+                            *status_guard = EngineState::Unloaded;
+                        }
                     }
-                    *status_guard = EngineState::Unloaded;
                 }
             }
         });
@@ -187,25 +160,43 @@ impl SpeechEngine {
         samples: Vec<f32>,
         reuse_workspace: bool,
     ) -> Result<String, String> {
-        let result =
-            self.transcribe_samples_inner(&samples, reuse_workspace, InferenceConfig::from_env())?;
+        self.ensure_model_loaded()?;
+        self.update_last_use();
 
-        if !result.text.trim().is_empty() {
-            let char_count = result.text.chars().count();
+        let mut model_guard = self.model.write().map_err(|e| e.to_string())?;
+        let model = model_guard.as_mut().ok_or("Model not ready")?;
+
+        let config = InferenceConfig::default();
+        let transcript = model
+            .transcribe_samples(samples, reuse_workspace, Some(config))
+            .map_err(|e| e.to_string())?;
+
+        if !transcript.text.trim().is_empty() {
+            let char_count = transcript.text.chars().count();
             log::info!("Transcription complete ({} chars)", char_count);
-            log::debug!("Transcript text: '{}'", result.text);
+            log::debug!("Transcript text: '{}'", transcript.text);
         }
 
-        Ok(result.text)
+        Ok(transcript.text)
     }
 
-    pub fn transcribe_samples_with_config(
+    pub fn start_streaming(
         &self,
-        samples: &[f32],
-        reuse_workspace: bool,
-        config: &InferenceConfig,
-    ) -> Result<Transcript, String> {
-        self.transcribe_samples_inner(samples, reuse_workspace, config.clone())
+    ) -> Result<std::sync::mpsc::Sender<crate::audio_processing::AudioFrame>, String> {
+        use crate::recording::Recorder;
+        let app = self.app_handle.as_ref().ok_or("No app handle")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app_handle = app.clone();
+        let model = self.model.clone();
+
+        let pipeline = Arc::new(crate::streaming::StreamingPipeline::new());
+        pipeline.start(rx, model, move |patch| {
+            if !patch.text.is_empty() {
+                Recorder::global().mark_streamed_any();
+                let _ = app_handle.emit("transcription_update", patch);
+            }
+        });
+        Ok(tx)
     }
 
     pub fn reset_model_state(&self) {
@@ -222,55 +213,9 @@ impl SpeechEngine {
         let model_root = default_model_root(app_handle);
         let model_dir = resolve_model_dir(&model_root)?;
 
-        if let Err(e) = crate::asr::ensure_vad_model(app_handle) {
-            log::warn!("VAD check failed: {}", e);
-        }
-
         log::info!("Loading ASR from {}", model_dir.display());
         let model = AsrModel::new(&model_dir, true)?;
         log::info!("ASR init took {:?}", start.elapsed());
         Ok(model)
-    }
-
-    fn transcribe_samples_inner(
-        &self,
-        samples: &[f32],
-        reuse_workspace: bool,
-        config: InferenceConfig,
-    ) -> Result<Transcript, String> {
-        if samples.is_empty() {
-            return Err("No audio captured.".to_string());
-        }
-
-        log::debug!(
-            "transcribe_samples: samples={}, reuse_workspace={}",
-            samples.len(),
-            reuse_workspace
-        );
-
-        self.ensure_model_loaded()?;
-
-        let mut model_guard = self
-            .model
-            .write()
-            .map_err(|_| "Model lock poisoned".to_string())?;
-        let model: &mut AsrModel = model_guard
-            .as_mut()
-            .ok_or_else(|| "Speech model is not loaded yet. Please try again.".to_string())?;
-
-        self.update_last_use();
-
-        let start = Instant::now();
-        let result = model
-            .transcribe_samples_ref(samples, reuse_workspace, Some(config))
-            .map_err(|err| {
-                let msg = err.user_message().to_string();
-                log::error!("Transcription error: {}", msg);
-                log::debug!("Transcription error detail: {err}");
-                msg
-            })?;
-
-        log::debug!("Transcription took {:?}", start.elapsed());
-        Ok(result)
     }
 }

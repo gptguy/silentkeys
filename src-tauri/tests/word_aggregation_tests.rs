@@ -1,5 +1,5 @@
-use silent_keys_lib::streaming::hypothesis::TokenWithTime;
-use silent_keys_lib::streaming::word_aggregation::tokens_to_words;
+use silent_keys_lib::streaming::words::tokens_to_words;
+use silent_keys_lib::streaming::words::TokenWithTime;
 
 fn make_token(text: &str, start_frame: usize, end_frame: usize) -> TokenWithTime {
     TokenWithTime {

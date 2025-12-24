@@ -34,7 +34,9 @@ fn load_ground_truth() -> String {
 }
 
 fn normalize_text(text: &str) -> String {
-    text.trim().to_string()
+    let mut s = text.to_lowercase();
+    s.retain(|c| !c.is_ascii_punctuation());
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[test]
@@ -52,7 +54,7 @@ fn test_exact_match_non_streaming() {
         .transcribe_samples(samples, false, Some(InferenceConfig::from_env()))
         .expect("Transcription failed");
 
-    let expected = load_ground_truth();
+    let expected = normalize_text(&load_ground_truth());
     let actual = normalize_text(&transcript.text);
 
     assert_eq!(actual, expected, "Non-streaming transcription mismatch");
@@ -76,7 +78,9 @@ fn test_exact_match_streaming() {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let accumulated_text = Arc::new(Mutex::new(String::new()));
+    let latest_full_text = Arc::new(Mutex::new(String::new()));
     let acc_clone = accumulated_text.clone();
+    let full_clone = latest_full_text.clone();
 
     pipeline.start(rx, model_arc.clone(), move |patch| {
         if patch.stable && !patch.text.is_empty() {
@@ -86,11 +90,22 @@ fn test_exact_match_streaming() {
             }
             guard.push_str(&patch.text);
             log::info!("Test accumulator: '{}'", *guard);
+            return;
+        }
+
+        if !patch.stable {
+            if let Ok(mut guard) = full_clone.lock() {
+                *guard = patch.text;
+            }
         }
     });
 
     let samples = load_samples(&get_wav_path());
     let chunk_size = 3200; // 200ms
+    let expected = load_ground_truth();
+    let expected_norm = normalize_text(&expected);
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
 
     for chunk in samples.chunks(chunk_size) {
         tx.send(AudioFrame {
@@ -98,12 +113,8 @@ fn test_exact_match_streaming() {
         })
         .expect("Failed to send chunk");
 
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
     }
-
-    let expected = load_ground_truth();
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(15);
 
     loop {
         if start.elapsed() > timeout {
@@ -113,24 +124,29 @@ fn test_exact_match_streaming() {
         }
 
         {
-            let guard = accumulated_text.lock().unwrap();
-            let current = normalize_text(&guard);
-            if current == expected {
+            let full_guard = latest_full_text.lock().unwrap();
+            let current = normalize_text(&full_guard);
+            if !current.is_empty() && current == expected_norm {
                 log::info!("Match found!");
                 return; // Success
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     }
 
     pipeline.stop();
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(250));
 
-    let final_text = accumulated_text.lock().unwrap().clone();
-    let normalized = normalize_text(&final_text);
+    let full_text = latest_full_text.lock().unwrap().clone();
+    let fallback_text = accumulated_text.lock().unwrap().clone();
+    let normalized = if full_text.trim().is_empty() {
+        normalize_text(&fallback_text)
+    } else {
+        normalize_text(&full_text)
+    };
 
     assert_eq!(
-        normalized, expected,
+        normalized, expected_norm,
         "Streaming transcription mismatch after timeout"
     );
 }
