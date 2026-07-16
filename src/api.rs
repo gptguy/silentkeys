@@ -26,16 +26,30 @@ pub struct ModelDownloadProgressDto {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub done: bool,
-    pub error: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
-pub struct TranscriptionPatchDto {
-    pub start: f64,
-    pub end: f64,
-    pub text: String,
-    pub stable: bool,
+#[serde(tag = "state", content = "message", rename_all = "snake_case")]
+pub enum EngineStateDto {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct AppUpdateInfoDto {
+    pub current_version: String,
+    pub version: String,
+    pub date: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+pub enum TranscriptionUpdateDto {
+    Append(String),
+    Replace(String),
 }
 
 #[derive(Serialize)]
@@ -48,21 +62,18 @@ struct SetStreamingArgs {
     enabled: bool,
 }
 
+#[derive(Serialize)]
+struct SetAsrLanguageArgs {
+    language: String,
+}
+
 async fn invoke_no_args(cmd: &str) -> Result<JsValue, String> {
     invoke(cmd, JsValue::NULL).await.map_err(extract_error)
 }
 
-pub async fn fetch_download_progress() -> Result<Option<ModelDownloadProgressDto>, String> {
-    let value = invoke_no_args("model_download_progress").await?;
-    if value.is_null() || value.is_undefined() {
-        return Ok(None);
-    }
+pub async fn fetch_engine_state() -> Result<EngineStateDto, String> {
+    let value = invoke_no_args("engine_state").await?;
     serde_wasm_bindgen::from_value(value).map_err(|err| err.to_string())
-}
-
-pub async fn check_model_ready_flag() -> Result<bool, String> {
-    let value = invoke_no_args("is_model_ready").await?;
-    Ok(value.as_bool().unwrap_or(false))
 }
 
 pub async fn retry_model_download_cmd() -> Result<(), String> {
@@ -73,11 +84,8 @@ pub async fn start_recording_cmd() -> Result<(), String> {
     invoke_no_args("start_recording").await.map(|_| ())
 }
 
-pub async fn stop_recording_cmd() -> Result<String, String> {
-    let value = invoke_no_args("stop_recording").await?;
-    value
-        .as_string()
-        .ok_or_else(|| "Invalid response format".to_string())
+pub async fn stop_recording_cmd() -> Result<(), String> {
+    invoke_no_args("stop_recording").await.map(|_| ())
 }
 
 pub async fn fetch_current_shortcut() -> Result<Option<String>, String> {
@@ -146,6 +154,42 @@ pub async fn save_streaming_enabled(enabled: bool) -> Result<(), String> {
         .await
         .map(|_| ())
         .map_err(extract_error)
+}
+
+pub async fn fetch_asr_language() -> Result<String, String> {
+    let value = invoke_no_args("get_asr_language").await?;
+    value
+        .as_string()
+        .ok_or_else(|| "Speech language response was invalid".to_string())
+}
+
+pub async fn fetch_asr_languages() -> Result<Vec<String>, String> {
+    let value = invoke_no_args("get_asr_languages").await?;
+    serde_wasm_bindgen::from_value(value).map_err(|err| err.to_string())
+}
+
+pub async fn save_asr_language(language: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetAsrLanguageArgs { language })
+        .map_err(|err| err.to_string())?;
+    invoke("set_asr_language", args)
+        .await
+        .map(|_| ())
+        .map_err(extract_error)
+}
+
+pub async fn check_for_app_update_cmd() -> Result<Option<AppUpdateInfoDto>, String> {
+    let value = invoke_no_args("check_for_app_update").await?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    serde_wasm_bindgen::from_value(value).map_err(|err| err.to_string())
+}
+
+pub async fn install_app_update_cmd() -> Result<bool, String> {
+    let value = invoke_no_args("install_app_update").await?;
+    value
+        .as_bool()
+        .ok_or_else(|| "Updater returned an invalid response".to_string())
 }
 
 pub fn extract_error(err: JsValue) -> String {

@@ -14,9 +14,11 @@ Please describe the tests that you ran to verify your changes.
 - [ ] Unit Tests
 - [ ] Manual verification on macOS
 
-# Checklist:
+# Checklist
 
-- [ ] I have run `cargo fmt` and `cargo clippy`
+- [ ] I have run `cargo fmt --all -- --check`
+- [ ] I have run `cargo test --workspace`
+- [ ] I have run `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] I have added tests that prove my fix is effective or that my feature works
 - [ ] My changes generate no new warnings
 - [ ] I have updated the documentation accordingly

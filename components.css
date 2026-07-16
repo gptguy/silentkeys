@@ -1,0 +1,160 @@
+input,
+.settings-select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  min-width: 0;
+}
+
+input:focus,
+.settings-select:focus {
+  outline: none;
+  border-color: var(--green);
+}
+
+.settings-input {
+  width: clamp(110px, 30vw, 160px);
+  font-family: var(--mono);
+}
+
+.settings-select {
+  width: clamp(150px, 40vw, 210px);
+}
+
+.transcription-body {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-strong);
+  background: var(--inset);
+  min-height: 92px;
+  transition: border-color 200ms ease;
+}
+
+.shell:has(.pill.live) .transcription-body {
+  border-left-color: var(--green);
+}
+
+.result-text {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.shell:has(.pill.live) .result-text::after {
+  content: "▍";
+  color: var(--green);
+  animation: caret 1s steps(1) infinite;
+}
+
+.settings-section {
+  margin-top: 4px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 14px 0;
+  flex-wrap: wrap;
+}
+
+.settings-row + .settings-row {
+  border-top: 1px solid var(--line);
+}
+
+.settings-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: min(220px, 100%);
+  flex: 1;
+}
+
+.settings-title {
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+.settings-hint,
+.settings-status {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-height: 0;
+  overflow-wrap: anywhere;
+}
+
+.path-code {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.settings-input-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-divider {
+  height: 1px;
+  background: var(--line);
+  margin: 4px 0 16px;
+}
+
+.settings-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.toggle {
+  appearance: none;
+  flex: none;
+  width: 40px;
+  height: 24px;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(158, 192, 172, 0.18);
+  border: none;
+  transition: background 160ms ease;
+}
+
+.toggle.active {
+  background: var(--green);
+}
+
+.toggle-track {
+  width: 100%;
+  height: 100%;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+}
+
+.toggle-thumb {
+  width: 20px;
+  height: 20px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms ease;
+}
+
+.toggle.active .toggle-thumb {
+  transform: translateX(16px);
+}

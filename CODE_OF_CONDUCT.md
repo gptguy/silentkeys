@@ -58,10 +58,10 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-email.
-All complaints will be reviewed and investigated promptly and fairly.
+Report abusive, harassing, or otherwise unacceptable behavior occurring on
+GitHub through [GitHub's private abuse-reporting process](https://support.github.com/contact/report-abuse).
+Do not include sensitive personal information in a public repository issue.
+This repository does not currently publish a separate private moderation inbox.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

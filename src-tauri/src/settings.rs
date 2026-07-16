@@ -3,13 +3,26 @@ use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
-#[derive(Serialize, Deserialize, Default)]
+pub const DEFAULT_ASR_LANGUAGE: &str = "en-US";
+
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
     pub model_path: Option<String>,
     pub streaming_enabled: bool,
+    pub asr_language: String,
 }
 
 const STORE_PATH: &str = "settings.json";
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            streaming_enabled: false,
+            asr_language: DEFAULT_ASR_LANGUAGE.to_string(),
+        }
+    }
+}
 
 pub fn get_settings(app: &AppHandle) -> Settings {
     match app.store(STORE_PATH) {
@@ -21,9 +34,14 @@ pub fn get_settings(app: &AppHandle) -> Settings {
                 .get("streaming_enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let asr_language = store
+                .get("asr_language")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| DEFAULT_ASR_LANGUAGE.to_string());
             Settings {
                 model_path,
                 streaming_enabled,
+                asr_language,
             }
         }
         Err(e) => {
@@ -48,6 +66,7 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String>
         "streaming_enabled",
         serde_json::json!(settings.streaming_enabled),
     );
+    store.set("asr_language", serde_json::json!(settings.asr_language));
 
     log::info!(
         "Saving settings: streaming_enabled={}",

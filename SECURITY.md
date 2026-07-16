@@ -11,18 +11,10 @@ Only the latest release of SilentKeys is currently supported with security updat
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in SilentKeys, please report it privately.
+Report vulnerabilities with GitHub's
+[private vulnerability reporting form](https://github.com/gptguy/silentkeys/security/advisories/new).
+Do not open a public issue or disclose the vulnerability before it has been
+addressed.
 
-**Resulting from a vulnerability:**
-* Do not open a public issue.
-* Do not disclose the vulnerability until it has been addressed.
-
-**How to report:**
-Please open a github issue with details of the vulnerability.
-
-**What to include:**
-* Description of the vulnerability.
-* Steps to reproduce.
-* Potential impact.
-
-We appreciate your responsible disclosure and will work to resolve the issue promptly.
+Include a description, reproduction steps, affected versions, and the potential
+impact. Reports are reviewed by the repository maintainer.

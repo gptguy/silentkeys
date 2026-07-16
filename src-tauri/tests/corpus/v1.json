@@ -1,0 +1,12 @@
+{
+  "corpus_version": 1,
+  "max_wer": 0.02,
+  "clips": [
+    {
+      "name": "jfk-inaugural-clean-en-us",
+      "audio": "tests/samples/jfk.wav",
+      "transcript": "tests/samples/transcript.txt",
+      "language": "en-US"
+    }
+  ]
+}
