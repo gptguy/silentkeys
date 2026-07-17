@@ -103,8 +103,10 @@ fn verification_receipt_tracks_snapshot_metadata_and_manifest() {
 
     let asset_path = snapshot.join("asset.bin");
     std::fs::write(&asset_path, b"other").expect("fixture should be replaceable");
-    std::fs::File::open(&asset_path)
-        .expect("fixture should be readable")
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&asset_path)
+        .expect("fixture should be writable")
         .set_modified(UNIX_EPOCH + Duration::from_secs(1))
         .expect("fixture modification time should be adjustable");
     assert_eq!(
