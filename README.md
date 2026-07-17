@@ -134,6 +134,13 @@ macOS builds are not yet notarized, so the first updater-enabled release must be
 installed manually; once installed, the app checks for newer signed releases and
 installs them automatically.
 
+On first launch, try to open SilentKeys once, then open **System Settings →
+Privacy & Security**, scroll to **Security**, and click **Open Anyway**. Confirm
+the warning with **Open**. Only bypass Gatekeeper for a download you obtained
+from the SilentKeys releases page. See
+[Apple's guidance](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac)
+for the current macOS steps and security warning.
+
 ### Build from Source
 Install the [prerequisites](#prerequisites) listed under Quick Start, then run:
 ```bash

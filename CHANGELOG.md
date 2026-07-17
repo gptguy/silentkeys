@@ -38,9 +38,9 @@
   to keep push-to-talk latency predictable.
 - Extended the model-load wait boundary so integrity checks cannot falsely time
   out during normal disk contention.
-- Made virtual typing acknowledged and lossless, and corrected divergent partial
-  text from the final transcript, including clearing stale streamed text when
-  the final transcript is empty.
+- Made virtual typing acknowledged before transcript state advances, and
+  corrected divergent partial text from the final transcript, including
+  clearing stale streamed text when the final transcript is empty.
 - Surfaced dictation and speech-model failures in the UI instead of logging
   them silently, including failures on the global-shortcut path.
 - Added a production Content Security Policy.

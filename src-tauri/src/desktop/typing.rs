@@ -58,7 +58,8 @@ fn typing_sender() -> Result<&'static mpsc::Sender<TypingRequest>, TypingError> 
 }
 
 /// The receiver owns `Enigo` for its entire lifetime. Every request carries an
-/// acknowledgement, so transcript state advances only after typing succeeds.
+/// acknowledgement, so transcript state advances only after the keyboard API
+/// reports success.
 fn typing_worker(receiver: mpsc::Receiver<TypingRequest>) {
     let mut keyboard = Enigo::new(&Settings::default()).map_err(|error| error.to_string());
     while let Ok(request) = receiver.recv() {
@@ -130,8 +131,7 @@ pub(super) fn reset_buffer() -> Result<(), TypingError> {
 }
 
 /// Advances the transcript buffer to `target` only after the submitter
-/// acknowledges the keystrokes, so typed text is never ahead of or behind
-/// the recorded state.
+/// acknowledges the keyboard operation.
 fn deliver<E>(
     current: &mut String,
     target: String,

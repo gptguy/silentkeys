@@ -78,30 +78,28 @@ fn verification_receipt_tracks_snapshot_metadata_and_manifest() {
     std::fs::write(snapshot.join("asset.bin"), b"model").expect("fixture should be writable");
 
     let assets = [("asset.bin", 5, "expected-sha256")];
-    assert!(!verification_receipt_matches_for_tests(
-        &snapshot,
-        "revision-a",
-        &assets,
-    ));
+    assert!(
+        !verification_receipt_matches_for_tests(&snapshot, "revision-a", &assets)
+            .expect("receipt inspection should succeed")
+    );
 
     write_verification_receipt_for_tests(&snapshot, "revision-a", &assets)
         .expect("verification receipt should be writable");
-    assert!(verification_receipt_matches_for_tests(
-        &snapshot,
-        "revision-a",
-        &assets,
-    ));
+    assert!(
+        verification_receipt_matches_for_tests(&snapshot, "revision-a", &assets)
+            .expect("receipt inspection should succeed")
+    );
 
-    assert!(!verification_receipt_matches_for_tests(
-        &snapshot,
-        "revision-b",
-        &assets,
-    ));
+    assert!(
+        !verification_receipt_matches_for_tests(&snapshot, "revision-b", &assets)
+            .expect("receipt inspection should succeed")
+    );
     assert!(!verification_receipt_matches_for_tests(
         &snapshot,
         "revision-a",
         &[("asset.bin", 5, "replacement-sha256")],
-    ));
+    )
+    .expect("receipt inspection should succeed"));
 
     let asset_path = snapshot.join("asset.bin");
     std::fs::write(&asset_path, b"other").expect("fixture should be replaceable");
@@ -115,11 +113,16 @@ fn verification_receipt_tracks_snapshot_metadata_and_manifest() {
             .len(),
         5,
     );
-    assert!(!verification_receipt_matches_for_tests(
-        &snapshot,
-        "revision-a",
-        &assets,
-    ));
+    assert!(
+        !verification_receipt_matches_for_tests(&snapshot, "revision-a", &assets)
+            .expect("receipt inspection should succeed")
+    );
+
+    let missing_snapshot = temp_dir.join("missing");
+    let error = write_verification_receipt_for_tests(&missing_snapshot, "revision-a", &assets)
+        .expect_err("missing asset metadata should be contextualized");
+    assert!(error.contains("read model asset metadata"));
+    assert!(error.contains("asset.bin"));
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }

@@ -112,8 +112,13 @@ where
 {
     let root = root.as_ref();
     let snapshot = root.join("snapshots").join(MODEL_SPEC.revision);
-    if verification::receipt_matches(&snapshot, MODEL_SPEC.revision, MODEL_SPEC.assets) {
-        return Ok(snapshot);
+    match verification::receipt_matches(&snapshot, MODEL_SPEC.revision, MODEL_SPEC.assets) {
+        Ok(true) => return Ok(snapshot),
+        Ok(false) => {}
+        Err(error) => log::warn!(
+            "Could not inspect model verification receipt at {}: {error}",
+            snapshot.display()
+        ),
     }
 
     let invalid = invalid_model_files(&snapshot)?;
