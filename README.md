@@ -2,18 +2,17 @@
 
 # 🗝️ SilentKeys
 
-**Real-time, fully offline desktop dictation.**
+**Real-time, local desktop dictation.**
 
 macOS-first, with experimental Linux and Windows builds.  
-Fast, private, and small. No cloud, no telemetry.
+Audio and transcription stay on-device. No telemetry.
 
 [![Platform](https://img.shields.io/badge/platform-macOS-blue.svg)](https://www.apple.com/macos/)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![UI - Tauri v2](https://img.shields.io/badge/ui-Tauri_v2-FFC131.svg)](https://v2.tauri.app/)
 [![Frontend - Leptos](https://img.shields.io/badge/frontend-Leptos-red.svg)](https://leptos.dev/)
-[![Speech Engine - Parakeet](https://img.shields.io/badge/speech_engine-Parakeet-6f42c1.svg)](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/models.html)
+[![Speech Engine - Nemotron](https://img.shields.io/badge/speech_engine-Nemotron-6f42c1.svg)](https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8)
 [![License - MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/gptguy/silentkeys?style=social)](https://github.com/gptguy/silentkeys/stargazers)
 [![publish](https://github.com/gptguy/silentkeys/actions/workflows/publish.yml/badge.svg)](https://github.com/gptguy/silentkeys/actions/workflows/publish.yml)
 
 <p align="center">
@@ -24,69 +23,45 @@ Fast, private, and small. No cloud, no telemetry.
 
 ---
 
-## 📋 Table of Contents
-
-- [About](#-about)
-- [Features](#-features)
-- [Why SilentKeys?](#-why-silentkeys)
-- [How It Works](#-how-it-works)
-- [Quick Start](#-quick-start)
-- [Installation](#-installation)
-- [Roadmap](#️-roadmap)
-- [Who Is This For?](#-who-is-this-for)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Acknowledgments](#-acknowledgments)
-
----
-
 ## 💡 About
 
-SilentKeys is a local-first desktop dictation app that performs all audio capture and transcription locally on your machine. It is designed for everyday use on Apple Silicon Macs and remains under active development.
+SilentKeys is a desktop dictation app that performs all audio capture and transcription locally on your machine, streaming text into whatever application has focus — no plugins required. The scope is deliberately narrow: local, system-wide speech-to-text and nothing else. It is designed for everyday use on Apple Silicon Macs and remains under active development.
 
 - **Target Platform**: macOS 14+ on Apple Silicon (M1/M2/M3/M4).
-- **Secondary Platforms**: Intel macOS, Linux, and Windows builds are available via Cargo but are currently considered experimental.
-- **Resource Footprint** (M-series Mac, release build):
-  - **Binary Size**: ~10 MB (native engine)
-  - **Memory Usage**: ~800–900 MB (with default quantized Parakeet model loaded)
+- **Secondary Platforms**: The release workflow targets Intel macOS, Linux, and Windows, but those builds remain experimental until their platform acceptance gates pass.
+- **Resource Footprint** (measured on an M-series Mac):
+  - **App executable**: approximately 20 MB; signed updater archive approximately 9 MB
+  - **Downloaded model**: approximately 683 MB
+  - **Memory usage**: approximately 800–900 MB with the model loaded
 
 > [!NOTE] 
 > **Status: Beta**  
-> Stable for everyday dictation on Apple Silicon Macs. Some features and configuration options are still evolving.
+> The core path is regression-tested on Apple Silicon, but distribution and
+> broader-corpus accuracy acceptance are still in progress.
 
 ---
 
 ## ✨ Features
 
-- 🏎 **Real-time Dictation**: Types text directly into any application as you speak.
-- 🔒 **Offline Only**: Audio and transcripts never leave your device.
-- 🧠 **High-Quality Models**: Uses NVIDIA's Parakeet models running on ONNX Runtime, optimized for Apple Silicon.
-- 🖥 **macOS-First**: Native feel with global push-to-talk, streaming output, and minimal latency.
-- ⚙️ **Rust Core**: Built for performance, low latency, and stability.
-- 🪶 **Lightweight UI**: Powered by Tauri v2 and Leptos (no Electron overhead).
-- 🛡️ **Zero Telemetry**: No analytics, tracking, or background network calls.
-- 🆓 **Open Source**: MIT licensed and free to use.
-
----
-
-## 🚀 Why SilentKeys?
-
-Most dictation tools affect your privacy, transparency, or workflow. SilentKeys eliminates these compromises:
-
-- **Local Processing**: All audio capture and transcription happen on-device.
-- **Transparency**: The codebase is fully open source, allowing you to audit how your data is handled.
-- **Workflow Integration**: Streams text into your existing tools (email, code editors, chat) without requiring plugins.
-- **Modern Stack**: Built on Rust, Tauri, and ONNX Runtime for a lean, maintainable, and predictable application.
+- **Real-time Dictation**: Types text directly into any application as you speak.
+- **Local Transcription**: Audio and transcripts never leave your device.
+- **Streaming ASR**: Uses a pinned INT8 export of NVIDIA Nemotron 3.5, a cache-aware Parakeet/FastConformer-family model, through ONNX Runtime.
+- **macOS-First**: Native feel with global push-to-talk, streaming output, and minimal latency.
+- **Rust Core**: Built for performance, low latency, and stability.
+- **Lightweight UI**: Powered by Tauri v2 and Leptos (no Electron overhead).
+- **Zero Telemetry**: No analytics or tracking.
+- **Open Source**: MIT licensed and free to use.
 
 ---
 
 ## 🧩 How It Works
 
-The speech engine uses Parakeet models via ONNX Runtime embedded in a Rust core.
+The Rust core runs a pinned Nemotron 3.5 INT8 model locally through ONNX Runtime
+and `parakeet-rs`. It does not use the separate Parakeet TDT 0.6B v3 model.
 
-1. **Global Hook**: A lightweight Rust daemon listens for the configurable push-to-talk shortcut.
-2. **Audio Capture**: Captures high-fidelity audio from the system microphone using low-latency buffers.
-3. **Inference**: Audio chunks are processed by the Parakeet model via ONNX Runtime.
+1. **Global Shortcut**: The desktop app listens for the configurable push-to-talk shortcut.
+2. **Audio Capture**: Captures the system microphone through a real-time-safe ring buffer and resamples to 16 kHz mono.
+3. **Inference**: Audio chunks are processed by Nemotron via ONNX Runtime.
 4. **Streaming**: Partial transcripts are streamed while audio is captured.
 5. **Virtual Typing**: The `Enigo` crate drives virtual keypresses to insert text into the focused window.
 
@@ -95,9 +70,12 @@ The speech engine uses Parakeet models via ONNX Runtime embedded in a Rust core.
 ## ⚡ Quick Start
 
 ### Prerequisites
-- **macOS 14.0+ (Sonoma)** recommended.
-- **Apple Silicon** (M1 or newer).
-- **Rust Toolchain**: Installed via `rustup`.
+- **macOS 14.0+ (Sonoma)** recommended, on **Apple Silicon** (M1 or newer).
+- **Xcode Command Line Tools**: `xcode-select --install`
+- **Rust**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **WebAssembly Target**: `rustup target add wasm32-unknown-unknown`
+- **Trunk**: `cargo install trunk`
+- **Tauri CLI**: `cargo install tauri-cli --locked`
 
 ### Running Locally
 
@@ -115,40 +93,49 @@ cargo tauri dev
 ```bash
 cargo tauri build
 ```
-The bundled application will be available at:  
-`src-tauri/target/release/bundle/macos/SilentKeys.app`
+The macOS application bundle will be available at:
+`target/release/bundle/macos/SilentKeys.app`
 
 ---
 
 ## 🎙 Usage
 
-1. **Start Dictation**: Press **⌥Z** (Option+Z) to begin.
-2. **Speak**: Speak normally; text will appear in your active application.
-3. **Stop**: Press the shortcut again (or stop speaking) to finish the session.
+1. **Start Dictation**: Press and hold **⌥Z** (Option+Z).
+2. **Speak**: Text is typed into the focused application while you hold the shortcut.
+3. **Stop**: Release the shortcut.
 
 ### Configuration
 Preferences can be accessed via the UI to configure:
 - **Global Shortcut**: Customize the hotkey.
+- **Speech Language**: Use deterministic English (US), follow the system locale,
+  enable automatic detection, or select any language prompt exposed by the
+  installed model.
 - **Streaming Mode**: Toggle real-time text visualization.
 - **Model Path**: Manage the location of the ONNX model files.
+
+Model-path changes take effect after the application restarts.
+
+English (US) is the default because an explicit language prompt is more
+predictable than language detection for English dictation. The language dropdown
+also offers the operating-system language, automatic detection, and every
+distinct language prompt declared by the installed Nemotron model. The dropdown
+uses the first code declared for each prompt so aliases do not create duplicate
+choices. Accuracy and latency vary by language, accent, audio quality, and
+hardware.
 
 ---
 
 ## 📥 Installation
 
 ### Download
-Official signed DMG builds and a Homebrew tap will be available soon.
+Prebuilt binaries are published on the
+[GitHub Releases](https://github.com/gptguy/silentkeys/releases) page. Public
+macOS builds are not yet notarized, so the first updater-enabled release must be
+installed manually; once installed, the app checks for newer signed releases and
+installs them automatically.
 
 ### Build from Source
-To build from source, ensure you have the following installed:
-
-1. **Xcode Command Line Tools**: `xcode-select --install`
-2. **Rust**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-3. **WebAssembly Target**: `rustup target add wasm32-unknown-unknown`
-4. **Trunk**: `cargo install trunk`
-5. **Tauri CLI**: `cargo install tauri-cli --locked`
-
-Then run:
+Install the [prerequisites](#prerequisites) listed under Quick Start, then run:
 ```bash
 cargo tauri build
 ```
@@ -162,14 +149,16 @@ cargo tauri build
 - [ ] Add local-only crash reporting (opt-in).
 
 **Performance**
-- [ ] Benchmark Parakeet vs. alternative ASR architectures.
+- [x] Record exact-fixture release performance and real-time factor.
+- [ ] Benchmark representative dictation corpora against alternative ASR architectures.
 - [ ] Optimize batching for long dictation sessions.
-- [ ] leverage ONNX Runtime Execution Providers (CoreML, Metal).
+- [ ] Evaluate ONNX Runtime execution providers where they improve measured latency.
 
 **Distribution**
 - [ ] Provide signed and notarized DMG releases.
 - [ ] Create Homebrew tap (`brew install --cask silentkeys`).
-- [ ] Implement automatic updates.
+- [x] Implement signed automatic updates.
+- [ ] Complete two-release updater acceptance on every release target.
 
 ---
 
@@ -177,18 +166,11 @@ cargo tauri build
 
 SilentKeys is private by default:
 
-- **No Cloud Services**: All processing is local.
+- **No Cloud Transcription**: Speech processing is local; networking is limited
+  to model downloads plus signed update checks and downloads.
 - **No Analytics**: No usage data or metrics are collected.
-- **No Auto-Updates**: Release builds do not perform background checks.
-- **Offline Capable**: Works entirely without an internet connection (after model download).
-
----
-
-## 🧑‍🤝‍🧑 Who Is This For?
-
-- **Privacy-conscious professionals** (legal, healthcare, journalism).
-- **Writers and creators** who prefer voice drafting.
-- **Accessibility users** seeking a robust, offline-capable dictation tool.
+- **Signed Updates**: Release builds are configured to check immediately and every six hours, install a newer signed GitHub Release automatically, and request restart.
+- **Offline Dictation**: Dictation continues without an internet connection after the model is downloaded.
 
 ---
 
@@ -206,18 +188,7 @@ Licensed under the [MIT License](LICENSE).
 
 ## ⭐ Acknowledgments
 
-- **[Parakeet](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/models.html)**: State-of-the-art ASR models.
+- **[Nemotron 3.5 ASR](https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8)**: The local speech model.
 - **[ONNX Runtime](https://onnxruntime.ai/)**: High-performance inference engine.
 - **[Tauri](https://tauri.app/)**: For the lightweight application framework.
 - **[Leptos](https://leptos.dev/)**: For the reactive frontend.
-
----
-
-<div align="center">
-
-**SilentKeys**  
-*Dictation that stays on your machine.*
-
-[⬆ Back to Top](#-silentkeys)
-
-</div>

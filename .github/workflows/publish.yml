@@ -56,25 +56,57 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
+          components: clippy
           
       - name: Install wasm target + trunk
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo install --locked trunk
+          cargo install --locked trunk --version 0.21.14
           
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
 
+      - name: test
+        run: cargo test --workspace
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: build and publish (all desktop targets)
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: app-v__VERSION__
           releaseName: 'App v__VERSION__'
           releaseBody: 'See the assets to download this version and install.'
           releaseDraft: true
           prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
           args: ${{ matrix.args }}
+
+  verify-updater-manifest:
+    needs: publish-desktop
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: verify signed updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          gh release download "app-v${version}" --pattern latest.json --dir updater-manifest
+          jq -e --arg version "$version" '
+            .version == $version and
+            ((["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"]
+              - (.platforms | keys)) | length == 0) and
+            ([.platforms[] |
+              (.signature | length > 0) and
+              (.url | startswith("https://"))] | all)
+          ' updater-manifest/latest.json

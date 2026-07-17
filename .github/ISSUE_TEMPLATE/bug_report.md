@@ -20,10 +20,11 @@ A clear description of the issue.
 
 ## 💻 System Info
 
-- macOS version:
-- Hardware:
+- Operating system and version:
+- CPU architecture and hardware:
 - SilentKeys version:
-- How installed? (DMG / source / Homebrew)
+- Installation method (release artifact / source):
+- Streaming enabled or disabled:
 
 ## 📝 Additional Context
 

@@ -1,146 +1,185 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 
-use crate::streaming::TranscriptionPatch;
-use enigo::{Enigo, Keyboard, Settings};
-use rtrb::RingBuffer;
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
+use crate::errors::UserFacing;
 
 static TRANSCRIPTION_BUFFER: OnceLock<Mutex<String>> = OnceLock::new();
-static TYPING_PRODUCER: OnceLock<Mutex<rtrb::Producer<String>>> = OnceLock::new();
+static TYPING_SENDER: OnceLock<Result<mpsc::Sender<TypingRequest>, String>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalDelivery {
+    None,
+    Append(String),
+    Replace { previous_chars: usize, text: String },
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TypingError {
+    #[error("typing state is unavailable")]
+    State,
+    #[error("typing worker is unavailable: {0}")]
+    Worker(String),
+    #[error("virtual keyboard failed: {0}")]
+    Keyboard(String),
+}
+
+impl UserFacing for TypingError {
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::Keyboard(_) => "Could not type into the focused app. Check input permissions.",
+            Self::State | Self::Worker(_) => "Text output is unavailable. Please restart the app.",
+        }
+    }
+}
+
+struct TypingRequest {
+    delivery: FinalDelivery,
+    completion: mpsc::Sender<Result<(), String>>,
+}
 
 fn transcription_buffer() -> &'static Mutex<String> {
     TRANSCRIPTION_BUFFER.get_or_init(|| Mutex::new(String::new()))
 }
 
-fn typing_producer() -> &'static Mutex<rtrb::Producer<String>> {
-    TYPING_PRODUCER.get_or_init(|| {
-        log::info!("Initializing typing queue and worker thread");
-        let (prod, mut cons) = RingBuffer::<String>::new(256);
-        thread::spawn(move || {
-            log::info!("Typing worker thread started");
-            typing_worker(&mut cons);
-        });
-        Mutex::new(prod)
-    })
+fn typing_sender() -> Result<&'static mpsc::Sender<TypingRequest>, TypingError> {
+    TYPING_SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            thread::Builder::new()
+                .name("desktop-typing".to_string())
+                .spawn(move || typing_worker(receiver))
+                .map(|_| sender)
+                .map_err(|error| format!("start desktop typing thread: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| TypingError::Worker(error.clone()))
 }
 
-fn typing_worker(cons: &mut rtrb::Consumer<String>) {
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => {
-            log::info!("Enigo initialized successfully in worker thread");
-            e
-        }
-        Err(err) => {
-            log::error!("Failed to initialize Enigo for typing worker: {err}");
-            return;
-        }
-    };
+/// The receiver owns `Enigo` for its entire lifetime. Every request carries an
+/// acknowledgement, so transcript state advances only after typing succeeds.
+fn typing_worker(receiver: mpsc::Receiver<TypingRequest>) {
+    let mut keyboard = Enigo::new(&Settings::default()).map_err(|error| error.to_string());
+    while let Ok(request) = receiver.recv() {
+        let result = match &mut keyboard {
+            Ok(keyboard) => perform_delivery(keyboard, &request.delivery),
+            Err(error) => Err(error.clone()),
+        };
+        let _ = request.completion.send(result);
+    }
+}
 
-    log::info!("Typing worker entering main loop");
-    let mut chunks_processed = 0;
-    loop {
-        match cons.read_chunk(cons.slots()) {
-            Ok(chunk) => {
-                let (first, second) = chunk.as_slices();
-                let count = first.len() + second.len();
-                if count > 0 {
-                    chunks_processed += 1;
-                    log::info!(
-                        "Worker processing chunk #{}, {} items",
-                        chunks_processed,
-                        count
-                    );
-                    for text in first.iter().chain(second.iter()) {
-                        log::info!("About to type: {:?}", text);
-                        let start = std::time::Instant::now();
-                        if let Err(err) = enigo.text(text) {
-                            log::error!("Failed to type text: {err}");
-                        } else {
-                            log::info!("Typed {:?} in {:?}", text, start.elapsed());
-                        }
-                    }
-                    chunk.commit_all();
-                }
+fn perform_delivery(keyboard: &mut Enigo, delivery: &FinalDelivery) -> Result<(), String> {
+    match delivery {
+        FinalDelivery::None => Ok(()),
+        FinalDelivery::Append(text) => keyboard.text(text).map_err(|error| error.to_string()),
+        FinalDelivery::Replace {
+            previous_chars,
+            text,
+        } => {
+            for _ in 0..*previous_chars {
+                keyboard
+                    .key(Key::Backspace, Direction::Click)
+                    .map_err(|error| error.to_string())?;
             }
-            Err(_) => {
-                thread::sleep(std::time::Duration::from_millis(1));
+            if text.is_empty() {
+                return Ok(());
             }
+            keyboard.text(text).map_err(|error| error.to_string())
         }
     }
 }
 
-pub(super) fn reset_buffer() {
-    if let Ok(mut state) = transcription_buffer().lock() {
-        state.clear();
+fn submit(delivery: FinalDelivery) -> Result<(), TypingError> {
+    if delivery == FinalDelivery::None {
+        return Ok(());
+    }
+    let (completion, result) = mpsc::channel();
+    typing_sender()?
+        .send(TypingRequest {
+            delivery,
+            completion,
+        })
+        .map_err(|_| TypingError::Worker("request channel closed".to_string()))?;
+    result
+        .recv()
+        .map_err(|_| TypingError::Worker("acknowledgement channel closed".to_string()))?
+        .map_err(TypingError::Keyboard)
+}
+
+pub fn plan_final_delivery(current: &str, final_text: &str) -> FinalDelivery {
+    if current == final_text {
+        return FinalDelivery::None;
+    }
+    if let Some(suffix) = final_text.strip_prefix(current) {
+        return FinalDelivery::Append(suffix.to_string());
+    }
+    FinalDelivery::Replace {
+        previous_chars: current.chars().count(),
+        text: final_text.to_string(),
     }
 }
 
-fn queue_text(text: String) {
-    log::info!("Queueing for typing: {:?}", text);
-    if let Ok(mut prod) = typing_producer().lock() {
-        match prod.push(text.clone()) {
-            Ok(_) => log::info!("Successfully queued text"),
-            Err(_) => log::error!("Typing queue full, text dropped: {:?}", text),
-        }
-    } else {
-        log::error!("Failed to lock typing producer");
-    }
-}
-
-pub(super) fn append_and_type(text: String) {
-    if text.is_empty() {
-        return;
-    }
-
-    if let Ok(mut state) = transcription_buffer().lock() {
-        state.push_str(&text);
-        queue_text(text);
-    }
-}
-
-fn current_transcription() -> Option<String> {
+pub(super) fn reset_buffer() -> Result<(), TypingError> {
     transcription_buffer()
         .lock()
-        .ok()
-        .map(|state| state.clone())
+        .map_err(|_| TypingError::State)?
+        .clear();
+    Ok(())
 }
 
-fn suffix_after_prefix(prefix: &str, full: &str) -> Option<String> {
-    let prefix_trimmed = prefix.trim_end();
-    let full_trimmed = full.trim_end();
-    if full_trimmed.len() < prefix_trimmed.len() {
-        return None;
-    }
-    if !full_trimmed.starts_with(prefix_trimmed) {
-        return None;
-    }
-    let suffix = &full_trimmed[prefix_trimmed.len()..];
-    if suffix.trim().is_empty() {
-        return None;
-    }
-    Some(suffix.to_string())
+/// Advances the transcript buffer to `target` only after the submitter
+/// acknowledges the keystrokes, so typed text is never ahead of or behind
+/// the recorded state.
+fn deliver<E>(
+    current: &mut String,
+    target: String,
+    submit: impl FnOnce(FinalDelivery) -> Result<(), E>,
+) -> Result<(), E> {
+    submit(plan_final_delivery(current, &target))?;
+    *current = target;
+    Ok(())
 }
 
-pub(super) fn append_offline_suffix(text: String) -> bool {
-    let current = match current_transcription() {
-        Some(value) => value,
-        None => return false,
-    };
-    if current.trim().is_empty() {
-        append_and_type(text);
-        return true;
-    }
-    if let Some(suffix) = suffix_after_prefix(&current, &text) {
-        append_and_type(suffix);
-        return true;
-    }
-    false
+fn append<E>(
+    current: &mut String,
+    text: String,
+    submit: impl FnOnce(FinalDelivery) -> Result<(), E>,
+) -> Result<(), E> {
+    submit(FinalDelivery::Append(text.clone()))?;
+    current.push_str(&text);
+    Ok(())
 }
 
-pub(super) fn apply_patch_for_typing(patch: TranscriptionPatch) {
-    if !patch.stable || patch.text.is_empty() {
-        return;
-    }
-    log::info!("Enigo patch: start={}, text={:?}", patch.start, patch.text);
-    append_and_type(patch.text);
+#[doc(hidden)]
+pub fn deliver_for_tests(
+    current: &mut String,
+    target: String,
+    submit: impl FnOnce(FinalDelivery) -> Result<(), String>,
+) -> Result<(), String> {
+    deliver(current, target, submit)
+}
+
+#[doc(hidden)]
+pub fn append_for_tests(
+    current: &mut String,
+    text: String,
+    submit: impl FnOnce(FinalDelivery) -> Result<(), String>,
+) -> Result<(), String> {
+    append(current, text, submit)
+}
+
+pub(super) fn append_streaming_text(text: String) -> Result<(), TypingError> {
+    let mut current = transcription_buffer()
+        .lock()
+        .map_err(|_| TypingError::State)?;
+    append(&mut current, text, submit)
+}
+
+pub(super) fn deliver_final_text(text: String) -> Result<(), TypingError> {
+    let mut current = transcription_buffer()
+        .lock()
+        .map_err(|_| TypingError::State)?;
+    deliver(&mut current, text, submit)
 }

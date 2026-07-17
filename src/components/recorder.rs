@@ -14,7 +14,6 @@ pub fn RecorderSection(
     set_model_error: WriteSignal<Option<String>>,
     model_error: ReadSignal<Option<String>>,
     set_transcription: WriteSignal<String>,
-    streaming_enabled: ReadSignal<bool>,
 ) -> impl IntoView {
     let toggle_recording = move |_| {
         if !model_ready.get() {
@@ -56,17 +55,10 @@ pub fn RecorderSection(
         spawn_local(async move {
             set_status.set("Stopping recording...".to_string());
             set_transcribing.set(true);
-            let is_streaming = streaming_enabled.get_untracked();
-            if !is_streaming {
-                set_transcription.set(String::new());
-            }
 
             match stop_recording_cmd().await {
-                Ok(text) => {
+                Ok(()) => {
                     set_is_recording.set(false);
-                    if !is_streaming {
-                        set_transcription.set(text);
-                    }
                     set_status.set("Finished.".to_string());
                 }
                 Err(err) => {
@@ -88,9 +80,17 @@ pub fn RecorderSection(
                 <span class="pill"
                     class:live=move || is_recording.get()
                     class:glow=move || transcribing.get()
-                    class:idle=move || !is_recording.get() && !transcribing.get()
+                    class:idle=move || model_ready.get() && !is_recording.get() && !transcribing.get()
+                    class:preparing=move || !model_ready.get() && model_error.get().is_none()
+                    class:unavailable=move || !model_ready.get() && model_error.get().is_some()
                 >
-                    {move || if is_recording.get() { "Listening" } else if transcribing.get() { "Transcribing" } else { "Idle" }}
+                    {move || {
+                        if is_recording.get() { "Listening" }
+                        else if transcribing.get() { "Transcribing" }
+                        else if !model_ready.get() && model_error.get().is_some() { "Unavailable" }
+                        else if !model_ready.get() { "Preparing" }
+                        else { "Idle" }
+                    }}
                 </span>
             </div>
             <div class="control-row">
@@ -109,9 +109,9 @@ pub fn RecorderSection(
                 <div class="status-container">
                     <p class="inline-status">{ move || status.get() }</p>
                     {move || model_error.get().map(|err| view! {
-                         <div class="error-details">
+                        <div class="error-details">
                             <p class="error-msg">{err}</p>
-                            <code class="cmd-block">"hf download istupakov/parakeet-tdt-0.6b-v3-onnx"</code>
+                            <code class="cmd-block">"Use Retry model download after checking disk space and connectivity."</code>
                          </div>
                     })}
                 </div>

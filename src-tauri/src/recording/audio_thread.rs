@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{Receiver, Sender},
     Arc, Mutex,
 };
@@ -18,7 +18,7 @@ use super::{AudioCmd, RecordingError};
 pub(super) fn init_and_run_audio_thread(
     cmd_rx: Receiver<AudioCmd>,
     processed_samples: Arc<Mutex<Vec<f32>>>,
-    init_tx: Sender<Result<(), RecordingError>>,
+    init_tx: Sender<Result<(), ()>>,
     streaming_tx: Option<Sender<AudioFrame>>,
     overrun_count: Arc<AtomicUsize>,
 ) -> Result<(), RecordingError> {
@@ -27,9 +27,9 @@ pub(super) fn init_and_run_audio_thread(
         .default_input_device()
         .ok_or(RecordingError::NoInputDevice)?;
 
-    let stream_config = device
-        .default_input_config()
-        .map_err(|e| RecordingError::Device(e.to_string()))?;
+    let stream_config = device.default_input_config().map_err(|error| {
+        RecordingError::Device(format!("read default input configuration: {error}"))
+    })?;
 
     let sample_rate = stream_config.sample_rate();
     let channels = stream_config.channels() as usize;
@@ -38,16 +38,25 @@ pub(super) fn init_and_run_audio_thread(
         "Audio: {} Hz, {} channels, device={:?}",
         sample_rate,
         channels,
-        device.description().unwrap()
+        device
+            .description()
+            .map(|description| description.to_string())
+            .unwrap_or_else(|_| "unknown input device".to_string())
     );
 
     let (producer, mut consumer) = RingBuffer::<f32>::new(sample_rate as usize);
-    let err_fn = move |err| log::error!("Stream error: {}", err);
+    let stream_failed = Arc::new(AtomicBool::new(false));
+    let callback_failed = stream_failed.clone();
+    let err_fn = move |_| callback_failed.store(true, Ordering::Release);
+    let sample_format = stream_config.sample_format();
+    let stream_config = stream_config.into();
+    let mut processor = AudioProcessor::new(sample_rate as usize, TARGET_SAMPLE_RATE as usize)
+        .map_err(|e| RecordingError::AudioProcessingError(e.to_string()))?;
 
-    let stream = match stream_config.sample_format() {
+    let stream = match sample_format {
         cpal::SampleFormat::F32 => build_stream::<f32>(
             &device,
-            &stream_config.into(),
+            stream_config,
             producer,
             channels,
             err_fn,
@@ -55,7 +64,7 @@ pub(super) fn init_and_run_audio_thread(
         ),
         cpal::SampleFormat::I16 => build_stream::<i16>(
             &device,
-            &stream_config.into(),
+            stream_config,
             producer,
             channels,
             err_fn,
@@ -63,32 +72,32 @@ pub(super) fn init_and_run_audio_thread(
         ),
         cpal::SampleFormat::U16 => build_stream::<u16>(
             &device,
-            &stream_config.into(),
+            stream_config,
             producer,
             channels,
             err_fn,
             overrun_count.clone(),
         ),
-        _ => Err(cpal::BuildStreamError::DeviceNotAvailable),
+        _ => Err(cpal::Error::new(cpal::ErrorKind::UnsupportedConfig)),
     }
-    .map_err(|e| RecordingError::Device(e.to_string()))?;
+    .map_err(|error| RecordingError::Device(format!("build input stream: {error}")))?;
 
-    let mut stream = Some(stream);
     stream
-        .as_ref()
-        .unwrap()
         .play()
-        .map_err(|e| RecordingError::Device(e.to_string()))?;
+        .map_err(|error| RecordingError::Device(format!("start input stream: {error}")))?;
+    let mut stream = Some(stream);
 
     let _ = init_tx.send(Ok(()));
-
-    let mut processor = AudioProcessor::new(sample_rate as usize, TARGET_SAMPLE_RATE as usize)
-        .map_err(|e| RecordingError::AudioProcessingError(e.to_string()))?;
 
     let mut processed_local = Vec::new();
     let mut stopping = false;
 
     loop {
+        if stream_failed.load(Ordering::Acquire) {
+            return Err(RecordingError::Device(
+                "input stream failed during capture".to_string(),
+            ));
+        }
         if !stopping && matches!(cmd_rx.try_recv(), Ok(AudioCmd::Stop)) {
             stopping = true;
             stream.take();
@@ -104,9 +113,13 @@ pub(super) fn init_and_run_audio_thread(
                         let _ = tx.send(frame);
                     }
                 };
-                let _ = processor.process(f, &mut dispatch);
+                processor
+                    .process(f, &mut dispatch)
+                    .map_err(|e| RecordingError::AudioProcessingError(e.to_string()))?;
                 if !s.is_empty() {
-                    let _ = processor.process(s, &mut dispatch);
+                    processor
+                        .process(s, &mut dispatch)
+                        .map_err(|e| RecordingError::AudioProcessingError(e.to_string()))?;
                 }
                 chunk.commit_all();
             }
@@ -117,12 +130,14 @@ pub(super) fn init_and_run_audio_thread(
         }
     }
 
-    let _ = processor.flush(&mut |frame: AudioFrame| {
-        processed_local.extend_from_slice(&frame.samples);
-        if let Some(tx) = &streaming_tx {
-            let _ = tx.send(frame);
-        }
-    });
+    processor
+        .flush(&mut |frame: AudioFrame| {
+            processed_local.extend_from_slice(&frame.samples);
+            if let Some(tx) = &streaming_tx {
+                let _ = tx.send(frame);
+            }
+        })
+        .map_err(|e| RecordingError::AudioProcessingError(e.to_string()))?;
 
     if let Ok(mut guard) = processed_samples.lock() {
         *guard = processed_local;
@@ -133,26 +148,19 @@ pub(super) fn init_and_run_audio_thread(
 
 fn build_stream<T>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     mut producer: Producer<f32>,
     channels: usize,
-    err_fn: impl Fn(cpal::StreamError) + Send + 'static,
+    err_fn: impl FnMut(cpal::Error) + Send + 'static,
     overrun_count: Arc<AtomicUsize>,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: Sample + SizedSample + Send + 'static,
     f32: cpal::FromSample<T>,
 {
-    let has_logged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     device.build_input_stream(
         config,
         move |data: &[T], _: &_| {
-            if !has_logged.load(Ordering::Relaxed) {
-                log::debug!("CPAL: First chunk of {} samples", data.len());
-                has_logged.store(true, Ordering::Relaxed);
-            }
-
             if channels == 1 {
                 for &sample in data {
                     if producer.push(sample.to_sample::<f32>()).is_err() {

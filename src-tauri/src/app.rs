@@ -7,6 +7,9 @@ use crate::commands;
 use crate::desktop;
 use crate::engine::SpeechEngine;
 
+#[cfg(not(debug_assertions))]
+const AUTOMATIC_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
@@ -29,6 +32,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(SpeechEngine::new(handle));
@@ -36,20 +40,24 @@ pub fn run() {
         })
         .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
-            commands::is_model_ready,
-            commands::model_download_progress,
             commands::retry_model_download,
             commands::get_model_path,
             commands::set_model_path,
             commands::pick_model_folder,
             commands::start_recording,
             commands::stop_recording,
+            commands::engine_state,
             commands::update_record_shortcut,
             commands::get_record_shortcut,
             commands::default_record_shortcut,
             commands::get_use_streaming,
             commands::set_use_streaming,
-            commands::reset_settings
+            commands::get_asr_language,
+            commands::get_asr_languages,
+            commands::set_asr_language,
+            commands::reset_settings,
+            commands::check_for_app_update,
+            commands::install_app_update
         ])
         .build(context);
 
@@ -100,11 +108,7 @@ fn on_second_instance(app: &AppHandle, argv: Vec<String>, cwd: String) {
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = ort::init().with_name("silent-keys").commit() {
-        log::error!("Failed to initialize ONNX Runtime: {e}");
-    } else {
-        log::info!("ONNX Runtime initialized successfully");
-    }
+    schedule_automatic_updates(app.handle().clone());
 
     #[cfg(desktop)]
     {
@@ -114,6 +118,29 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(not(debug_assertions))]
+fn schedule_automatic_updates(app: AppHandle) {
+    let result = std::thread::Builder::new()
+        .name("automatic-updater".to_string())
+        .spawn(move || loop {
+            let update_app = app.clone();
+            tauri::async_runtime::block_on(async move {
+                match crate::updater::install_update(update_app).await {
+                    Ok(true) => log::info!("Automatic update installed; restarting"),
+                    Ok(false) => log::debug!("No automatic update available"),
+                    Err(err) => log::warn!("Automatic update skipped: {err}"),
+                }
+            });
+            std::thread::sleep(AUTOMATIC_UPDATE_INTERVAL);
+        });
+    if let Err(err) = result {
+        log::error!("Failed to start automatic updater: {err}");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn schedule_automatic_updates(_app: AppHandle) {}
 
 #[cfg(desktop)]
 fn prewarm_model(app_handle: AppHandle) {

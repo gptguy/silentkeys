@@ -1,5 +1,6 @@
 use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    audioadapter_buffers::direct::InterleavedSlice, Async, FixedAsync, Resampler,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::collections::VecDeque;
 
@@ -20,7 +21,7 @@ pub struct AudioFrame {
 }
 
 pub struct AudioProcessor {
-    resampler: Option<SincFixedOut<f32>>,
+    resampler: Option<Async<f32>>,
     buffer: VecDeque<f32>,
     scratch_in: Vec<f32>,
     scratch_out: Vec<f32>,
@@ -31,7 +32,7 @@ impl AudioProcessor {
         let resampler = if in_sample_rate != out_sample_rate {
             let params = SincInterpolationParameters {
                 sinc_len: 256,
-                f_cutoff: 0.95,
+                f_cutoff: Some(0.95),
                 interpolation: SincInterpolationType::Linear,
                 oversampling_factor: 256,
                 window: WindowFunction::BlackmanHarris2,
@@ -44,12 +45,13 @@ impl AudioProcessor {
             );
 
             Some(
-                SincFixedOut::<f32>::new(
+                Async::<f32>::new_sinc(
                     out_sample_rate as f64 / in_sample_rate as f64,
                     2.0,
-                    params,
+                    &params,
                     RESAMPLER_CHUNK_OUT,
                     1,
+                    FixedAsync::Output,
                 )
                 .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?,
             )
@@ -90,14 +92,15 @@ impl AudioProcessor {
                     }
                     self.buffer.drain(..needed);
 
-                    let resampled = resampler
-                        .process(&[&self.scratch_in], None)
+                    let input = InterleavedSlice::new(&self.scratch_in, 1, needed)
+                        .map_err(|e| AudioError::ResamplerProcessing(e.to_string()))?;
+                    let frame = resampler
+                        .process(&input, None)
                         .map_err(|e| AudioError::ResamplerProcessing(e.to_string()))?;
 
-                    for chunk in resampled {
-                        if !chunk.is_empty() {
-                            emit(AudioFrame { samples: chunk });
-                        }
+                    let samples = frame.take_data();
+                    if !samples.is_empty() {
+                        emit(AudioFrame { samples });
                     }
                 } else {
                     break;
@@ -140,13 +143,15 @@ impl AudioProcessor {
                     tail.resize(needed, 0.0);
                 }
 
-                let resampled = resampler
-                    .process(&[&tail], None)
+                let input = InterleavedSlice::new(&tail, 1, needed)
                     .map_err(|e| AudioError::ResamplerProcessing(e.to_string()))?;
-                for chunk in resampled {
-                    if !chunk.is_empty() {
-                        emit(AudioFrame { samples: chunk });
-                    }
+                let frame = resampler
+                    .process(&input, None)
+                    .map_err(|e| AudioError::ResamplerProcessing(e.to_string()))?;
+
+                let samples = frame.take_data();
+                if !samples.is_empty() {
+                    emit(AudioFrame { samples });
                 }
             }
         } else if !self.buffer.is_empty() {

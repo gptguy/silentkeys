@@ -12,6 +12,11 @@ What would you like to see added?
 
 Explain the need or problem solved.
 
+## 🎯 Speech-to-Text Scope
+
+Explain how this improves accurate, low-latency, local speech-to-text without
+turning SilentKeys into a general productivity suite.
+
 ## 📐 Proposed Implementation
 
 (Optional) Any ideas for how to approach it.

@@ -1,6 +1,51 @@
 use crate::api::*;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos::web_sys::{HtmlInputElement, HtmlSelectElement};
+use wasm_bindgen::JsCast;
+
+fn input_value(event: &leptos::ev::Event) -> String {
+    event
+        .target()
+        .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
+        .map(|input| input.value())
+        .unwrap_or_default()
+}
+
+fn select_value(event: &leptos::ev::Event) -> String {
+    event
+        .target()
+        .and_then(|target| target.dyn_into::<HtmlSelectElement>().ok())
+        .map(|select| select.value())
+        .unwrap_or_default()
+}
+
+fn language_label(language: &str) -> &str {
+    match language {
+        "en-US" => "English (US)",
+        _ => language,
+    }
+}
+
+async fn refresh_update_status(
+    set_status: WriteSignal<String>,
+    set_available: WriteSignal<Option<AppUpdateInfoDto>>,
+) {
+    match check_for_app_update_cmd().await {
+        Ok(Some(update)) => {
+            set_status.set(format!("Version {} is available.", update.version));
+            set_available.set(Some(update));
+        }
+        Ok(None) => {
+            set_available.set(None);
+            set_status.set("SilentKeys is up to date.".to_string());
+        }
+        Err(error) => {
+            set_available.set(None);
+            set_status.set(format!("Update check failed: {error}"));
+        }
+    }
+}
 
 #[component]
 pub fn SettingsSection(
@@ -10,9 +55,22 @@ pub fn SettingsSection(
     set_streaming_enabled: WriteSignal<bool>,
     shortcut: ReadSignal<String>,
     set_shortcut: WriteSignal<String>,
+    asr_language: ReadSignal<String>,
+    set_asr_language: WriteSignal<String>,
+    language_options: ReadSignal<Vec<String>>,
+    is_recording: ReadSignal<bool>,
+    transcribing: ReadSignal<bool>,
     set_status: WriteSignal<String>,
 ) -> impl IntoView {
     let (shortcut_status, set_shortcut_status) = signal(String::new());
+    let (language_status, set_language_status) = signal(String::new());
+    let (update_status, set_update_status) = signal("Checking for updates...".to_string());
+    let (available_update, set_available_update) = signal::<Option<AppUpdateInfoDto>>(None);
+
+    spawn_local(refresh_update_status(
+        set_update_status,
+        set_available_update,
+    ));
 
     let change_path_action = move |_| {
         spawn_local(async move {
@@ -54,6 +112,9 @@ pub fn SettingsSection(
                     if let Ok(enabled) = fetch_streaming_enabled().await {
                         set_streaming_enabled.set(enabled);
                     }
+                    if let Ok(language) = fetch_asr_language().await {
+                        set_asr_language.set(language);
+                    }
                     set_status.set("Settings reset.".to_string());
                 }
                 Err(e) => set_status.set(format!("Reset failed: {}", e)),
@@ -61,8 +122,94 @@ pub fn SettingsSection(
         });
     };
 
+    let change_language_action = move |event: leptos::ev::Event| {
+        let language = select_value(&event);
+        let previous = asr_language.get_untracked();
+        if language == previous {
+            return;
+        }
+        set_asr_language.set(language.clone());
+        set_language_status.set("Applying...".to_string());
+        spawn_local(async move {
+            match save_asr_language(language).await {
+                Ok(()) => set_language_status.set("Applied".to_string()),
+                Err(error) => {
+                    set_asr_language.set(previous);
+                    set_language_status.set(error);
+                }
+            }
+        });
+    };
+
+    let check_update_action = move |_| {
+        set_update_status.set("Checking for updates...".to_string());
+        spawn_local(refresh_update_status(
+            set_update_status,
+            set_available_update,
+        ));
+    };
+
+    let install_update_action = move |_| {
+        set_update_status.set("Installing update...".to_string());
+        spawn_local(async move {
+            match install_app_update_cmd().await {
+                Ok(true) => set_update_status.set("Update installed. Restarting...".to_string()),
+                Ok(false) => {
+                    set_available_update.set(None);
+                    set_update_status.set("SilentKeys is up to date.".to_string());
+                }
+                Err(err) => set_update_status.set(format!("Update install failed: {}", err)),
+            }
+        });
+    };
+
+    let update_details = move |update: &AppUpdateInfoDto| {
+        let mut details = format!(
+            "Current: {} - Latest: {}",
+            update.current_version, update.version
+        );
+        if let Some(date) = update.date.as_deref() {
+            details.push_str(&format!(" - Released: {}", date));
+        }
+        if let Some(body) = update.body.as_deref().filter(|body| !body.is_empty()) {
+            details.push_str(&format!(" - {}", body));
+        }
+        details
+    };
+
     view! {
         <div class="settings-section">
+            <div class="settings-row">
+                <div class="settings-label">
+                    <span class="settings-title">"Speech Language"</span>
+                    <span class="settings-hint">
+                        {move || if language_status.get().is_empty() {
+                            "English (US) avoids language detection.".to_string()
+                        } else {
+                            language_status.get()
+                        }}
+                    </span>
+                </div>
+                <select
+                    class="settings-input settings-select"
+                    prop:value=move || asr_language.get()
+                    disabled=move || language_options.get().is_empty()
+                        || is_recording.get()
+                        || transcribing.get()
+                    on:change=change_language_action
+                >
+                    <option value="system">"System language"</option>
+                    <option value="auto">"Automatic detection"</option>
+                    <For
+                        each=move || language_options.get()
+                        key=|language| language.clone()
+                        children=move |language| {
+                            let label = language_label(&language).to_string();
+                            view! { <option value=language>{label}</option> }
+                        }
+                    />
+                </select>
+            </div>
             <div class="settings-row">
                 <div class="settings-label">
                     <span class="settings-title">"Streaming Mode"</span>
@@ -90,9 +237,16 @@ pub fn SettingsSection(
                         type="text"
                         class="settings-input"
                         value=move || shortcut.get()
-                        on:input=move |ev| set_shortcut.set(crate::utils::input_value(&ev))
+                        disabled=move || is_recording.get() || transcribing.get()
+                        on:input=move |event| set_shortcut.set(input_value(&event))
                     />
-                    <button class="ghost compact" on:click=save_shortcut_action>"Save"</button>
+                    <button
+                        class="ghost compact"
+                        disabled=move || is_recording.get() || transcribing.get()
+                        on:click=save_shortcut_action
+                    >
+                        "Save"
+                    </button>
                 </div>
             </div>
             <div class="settings-row">
@@ -101,6 +255,27 @@ pub fn SettingsSection(
                     <code class="path-code">{ move || model_path.get() }</code>
                 </div>
                 <button class="ghost compact" on:click=change_path_action>"Change"</button>
+            </div>
+            <div class="settings-row">
+                <div class="settings-label">
+                    <span class="settings-title">"Updates"</span>
+                    <span class="settings-hint">{ move || update_status.get() }</span>
+                    {move || available_update.get().map(|update| view! {
+                        <p class="settings-status">
+                            {update_details(&update)}
+                        </p>
+                    })}
+                </div>
+                <div class="settings-input-group">
+                    <button class="ghost compact" on:click=check_update_action>"Check"</button>
+                    <button
+                        class="ghost compact"
+                        disabled=move || available_update.get().is_none()
+                        on:click=install_update_action
+                    >
+                        "Install"
+                    </button>
+                </div>
             </div>
             <div class="settings-divider"></div>
             <div class="settings-footer">

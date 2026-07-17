@@ -2,12 +2,43 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::asr::{
-    current_download_progress, default_model_root, record_failure, resolve_model_dir, AsrError,
-    AsrModel, DownloadProgress, InferenceConfig,
+    default_model_root, invalidate_model_verification, resolve_model_dir_with_progress, AsrError,
+    AsrModel,
 };
+use crate::errors::UserFacing;
+use crate::recording::Recorder;
+use crate::streaming::{StreamingError, StreamingPipeline, UpdateSink};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-#[derive(Clone, Debug, PartialEq)]
+const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(thiserror::Error, Debug)]
+pub enum EngineError {
+    #[error(transparent)]
+    Asr(#[from] AsrError),
+    #[error("speech engine state is unavailable")]
+    StateUnavailable,
+    #[error("speech model is unavailable")]
+    ModelUnavailable,
+    #[error("speech model load timed out")]
+    LoadTimeout,
+}
+
+impl UserFacing for EngineError {
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::Asr(error) => error.user_message(),
+            Self::LoadTimeout => "The speech model took too long to load. Please try again.",
+            Self::StateUnavailable | Self::ModelUnavailable => {
+                "The speech engine is unavailable. Please restart the app."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "state", content = "message", rename_all = "snake_case")]
 pub enum EngineState {
     Unloaded,
     Loading,
@@ -20,45 +51,47 @@ pub struct SpeechEngine {
     model: Arc<RwLock<Option<AsrModel>>>,
     status: Arc<Mutex<EngineState>>,
     status_cv: Arc<Condvar>,
-    last_use: Arc<Mutex<Instant>>,
-    app_handle: Option<AppHandle>,
+    streaming_pipeline: Arc<StreamingPipeline>,
+    app_handle: AppHandle,
+    recorder: &'static Recorder,
 }
 
 impl SpeechEngine {
     pub fn new(app_handle: AppHandle) -> Self {
-        let engine = Self {
+        Self {
             model: Arc::new(RwLock::new(None)),
             status: Arc::new(Mutex::new(EngineState::Unloaded)),
             status_cv: Arc::new(Condvar::new()),
-            last_use: Arc::new(Mutex::new(Instant::now())),
-            app_handle: Some(app_handle),
-        };
-        engine.spawn_idle_watcher();
-        engine
-    }
-
-    pub fn get_model(&self) -> Arc<RwLock<Option<AsrModel>>> {
-        self.model.clone()
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.status
-            .lock()
-            .map(|s| matches!(*s, EngineState::Loaded))
-            .unwrap_or(false)
-    }
-
-    fn update_last_use(&self) {
-        if let Ok(mut last) = self.last_use.lock() {
-            *last = Instant::now();
+            streaming_pipeline: Arc::new(StreamingPipeline::new()),
+            app_handle,
+            recorder: Recorder::global(),
         }
     }
 
-    pub fn download_progress(&self) -> Option<DownloadProgress> {
-        current_download_progress()
+    pub(crate) fn recorder(&self) -> &'static Recorder {
+        self.recorder
     }
 
-    pub fn retry_model_download(&self) -> Result<(), String> {
+    pub(crate) fn app(&self) -> &AppHandle {
+        &self.app_handle
+    }
+
+    pub fn is_dictating(&self) -> bool {
+        self.recorder.is_recording()
+    }
+
+    pub fn state(&self) -> EngineState {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| EngineState::Failed("Speech engine state is unavailable.".into()))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.state() == EngineState::Loaded
+    }
+
+    pub fn retry_model_download(&self) -> Result<(), EngineError> {
         if let Ok(mut status) = self.status.lock() {
             if matches!(*status, EngineState::Failed(_)) {
                 *status = EngineState::Unloaded;
@@ -67,61 +100,56 @@ impl SpeechEngine {
         self.ensure_model_loaded()
     }
 
-    pub fn ensure_model_loaded(&self) -> Result<(), String> {
-        self.update_last_use();
-
+    pub fn ensure_model_loaded(&self) -> Result<(), EngineError> {
         loop {
             let mut status = self
                 .status
                 .lock()
-                .map_err(|_| "Status lock poisoned".to_string())?;
+                .map_err(|_| EngineError::StateUnavailable)?;
             match *status {
                 EngineState::Loaded => return Ok(()),
                 EngineState::Unloaded => {
-                    if matches!(*status, EngineState::Loading) {
-                        return Ok(());
-                    }
                     *status = EngineState::Loading;
                     drop(status);
+                    self.emit_engine_state(&EngineState::Loading);
 
                     let app_handle = self.app_handle.clone();
                     let model_arc = self.model.clone();
                     let state_arc = self.status.clone();
                     let condvar = self.status_cv.clone();
 
-                    let app_emitter = app_handle.clone().ok_or("No app handle")?;
-                    let _ = app_emitter.emit("model_status", "loading");
-
                     std::thread::spawn(move || {
-                        match Self::init_model(&app_handle.unwrap()) {
-                            Ok(model) => {
-                                if let Ok(mut m) = model_arc.write() {
-                                    *m = Some(model);
+                        let outcome = match Self::init_model(&app_handle) {
+                            Ok(model) => match model_arc.write() {
+                                Ok(mut model_slot) => {
+                                    *model_slot = Some(model);
+                                    EngineState::Loaded
                                 }
-                                if let Ok(mut s) = state_arc.lock() {
-                                    *s = EngineState::Loaded;
+                                Err(_) => {
+                                    EngineState::Failed("Speech model state is unavailable.".into())
                                 }
-                                let _ = app_emitter.emit("model_status", "loaded");
+                            },
+                            Err(error) => {
+                                log::error!("Speech model init failed: {error}");
+                                EngineState::Failed(error.user_message().to_string())
                             }
-                            Err(e) => {
-                                let msg = e.user_message().to_string();
-                                log::error!("Load failed: {msg}");
-                                record_failure(msg.clone());
-                                if let Ok(mut s) = state_arc.lock() {
-                                    *s = EngineState::Failed(msg);
-                                }
-                            }
+                        };
+                        if let Ok(mut state) = state_arc.lock() {
+                            *state = outcome.clone();
+                        }
+                        if let Err(error) = app_handle.emit("engine_state", outcome) {
+                            log::warn!("Could not emit speech engine state: {error}");
                         }
                         condvar.notify_all();
                     });
                 }
                 EngineState::Loading => {
-                    let (_s, res) = self
+                    let (_status, wait_result) = self
                         .status_cv
-                        .wait_timeout(status, Duration::from_secs(30))
-                        .map_err(|_| "Wait timeout poisoned")?;
-                    if res.timed_out() {
-                        return Err("Model load failed: timeout".to_string());
+                        .wait_timeout(status, MODEL_LOAD_TIMEOUT)
+                        .map_err(|_| EngineError::StateUnavailable)?;
+                    if wait_result.timed_out() {
+                        return Err(EngineError::LoadTimeout);
                     }
                 }
                 EngineState::Failed(_) => {
@@ -131,72 +159,81 @@ impl SpeechEngine {
         }
     }
 
-    fn spawn_idle_watcher(&self) {
-        let (last_use, model, status) = (
-            self.last_use.clone(),
-            self.model.clone(),
-            self.status.clone(),
-        );
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(60));
-            if let Ok(last) = last_use.lock() {
-                if last.elapsed().as_secs() > 300 {
-                    if let Ok(mut status_guard) = status.lock() {
-                        if matches!(*status_guard, EngineState::Loaded) {
-                            log::info!("Unloading idle ASR model");
-                            if let Ok(mut m) = model.write() {
-                                *m = None;
-                            }
-                            *status_guard = EngineState::Unloaded;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn transcribe_samples(
-        &self,
-        samples: Vec<f32>,
-        reuse_workspace: bool,
-    ) -> Result<String, String> {
+    pub fn transcribe_samples(&self, samples: &[f32]) -> Result<String, EngineError> {
         self.ensure_model_loaded()?;
-        self.update_last_use();
 
-        let mut model_guard = self.model.write().map_err(|e| e.to_string())?;
-        let model = model_guard.as_mut().ok_or("Model not ready")?;
+        let mut model_guard = self
+            .model
+            .write()
+            .map_err(|_| EngineError::ModelUnavailable)?;
+        let model = model_guard.as_mut().ok_or(EngineError::ModelUnavailable)?;
 
-        let config = InferenceConfig::default();
-        let transcript = model
-            .transcribe_samples(samples, reuse_workspace, Some(config))
-            .map_err(|e| e.to_string())?;
+        let text = model.transcribe_samples(samples)?;
 
-        if !transcript.text.trim().is_empty() {
-            let char_count = transcript.text.chars().count();
+        if !text.trim().is_empty() {
+            let char_count = text.chars().count();
             log::info!("Transcription complete ({} chars)", char_count);
-            log::debug!("Transcript text: '{}'", transcript.text);
         }
 
-        Ok(transcript.text)
+        Ok(text)
+    }
+
+    pub fn languages(&self) -> Result<Vec<String>, EngineError> {
+        let model = self
+            .model
+            .read()
+            .map_err(|_| EngineError::ModelUnavailable)?;
+        Ok(model
+            .as_ref()
+            .ok_or(EngineError::ModelUnavailable)?
+            .languages()
+            .to_vec())
+    }
+
+    pub fn validate_language(&self, language: &str) -> Result<(), EngineError> {
+        let model = self
+            .model
+            .read()
+            .map_err(|_| EngineError::ModelUnavailable)?;
+        if model
+            .as_ref()
+            .ok_or(EngineError::ModelUnavailable)?
+            .supports_language(language)
+        {
+            return Ok(());
+        }
+        Err(AsrError::UnsupportedLanguage(language.to_string()).into())
+    }
+
+    pub fn set_language(&self, language: &str) -> Result<String, EngineError> {
+        let mut model = self
+            .model
+            .write()
+            .map_err(|_| EngineError::ModelUnavailable)?;
+        let selected = model
+            .as_mut()
+            .ok_or(EngineError::ModelUnavailable)?
+            .set_language(language)?;
+        log::info!("Nemotron ASR language hint changed to {selected}");
+        Ok(selected)
     }
 
     pub fn start_streaming(
         &self,
-    ) -> Result<std::sync::mpsc::Sender<crate::audio_processing::AudioFrame>, String> {
-        use crate::recording::Recorder;
-        let app = self.app_handle.as_ref().ok_or("No app handle")?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let app_handle = app.clone();
-        let model = self.model.clone();
+        on_update: impl UpdateSink,
+    ) -> Result<std::sync::mpsc::Sender<crate::audio_processing::AudioFrame>, StreamingError> {
+        if !self.is_ready() {
+            return Err(StreamingError::ModelNotReady);
+        }
 
-        let pipeline = Arc::new(crate::streaming::StreamingPipeline::new());
-        pipeline.start(rx, model, move |patch| {
-            if !patch.text.is_empty() {
-                Recorder::global().mark_streamed_any();
-                let _ = app_handle.emit("transcription_update", patch);
-            }
-        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.streaming_pipeline
+            .start(rx, self.model.clone(), on_update)?;
         Ok(tx)
+    }
+
+    pub fn finish_streaming(&self) -> Result<(), StreamingError> {
+        self.streaming_pipeline.finish()
     }
 
     pub fn reset_model_state(&self) {
@@ -211,11 +248,31 @@ impl SpeechEngine {
     fn init_model(app_handle: &AppHandle) -> Result<AsrModel, AsrError> {
         let start = Instant::now();
         let model_root = default_model_root(app_handle);
-        let model_dir = resolve_model_dir(&model_root)?;
+        let model_dir = resolve_model_dir_with_progress(&model_root, |progress| {
+            if let Err(error) = app_handle.emit("model_download_progress", progress) {
+                log::warn!("Could not emit model download progress: {error}");
+            }
+        })?;
+        let language = crate::settings::get_settings(app_handle).asr_language;
 
         log::info!("Loading ASR from {}", model_dir.display());
-        let model = AsrModel::new(&model_dir, true)?;
+        let model = AsrModel::new(&model_dir, &language).inspect_err(|_| {
+            invalidate_model_verification(&model_dir);
+        })?;
+        if !model.supports_language(&language) {
+            let mut settings = crate::settings::get_settings(app_handle);
+            settings.asr_language = crate::settings::DEFAULT_ASR_LANGUAGE.to_string();
+            if let Err(error) = crate::settings::save_settings(app_handle, &settings) {
+                log::warn!("Could not repair unsupported speech language setting: {error}");
+            }
+        }
         log::info!("ASR init took {:?}", start.elapsed());
         Ok(model)
+    }
+
+    fn emit_engine_state(&self, state: &EngineState) {
+        if let Err(error) = self.app_handle.emit("engine_state", state) {
+            log::warn!("Could not emit speech engine state: {error}");
+        }
     }
 }
