@@ -13,6 +13,8 @@
 
 ### Changed
 
+- Aligned experimental Linux release builds with ONNX Runtime's glibc 2.39
+  minimum (Ubuntu 24.04 or Debian 13).
 - Updated the Rust dependency graph to the latest compatible releases.
 - Hardened resumable model downloads with temporary files, digest validation,
   atomic installation, and repair of corrupt cached assets.
