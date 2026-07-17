@@ -1,6 +1,5 @@
 use tauri::{AppHandle, Emitter, State};
 
-use crate::activity::{self, ActivityError, ActivityGuard, AppActivity};
 #[cfg(desktop)]
 use crate::desktop;
 use crate::engine::{EngineState, SpeechEngine};
@@ -16,22 +15,6 @@ fn command_error(context: &str, err: impl UserFacing + std::fmt::Display) -> Str
     user_error(err)
 }
 
-fn reserve_settings_change() -> Result<ActivityGuard, String> {
-    match activity::try_begin(AppActivity::Configuring) {
-        Ok(guard) => Ok(guard),
-        Err(ActivityError::Busy(AppActivity::Recording)) => {
-            Err("Finish the current recording before changing settings.".to_string())
-        }
-        Err(ActivityError::Busy(AppActivity::Updating)) => {
-            Err("Wait for the app update to finish before changing settings.".to_string())
-        }
-        Err(ActivityError::Busy(AppActivity::Configuring)) => {
-            Err("A settings change is already in progress.".to_string())
-        }
-        Err(ActivityError::LockFailed) => Err("Settings are temporarily unavailable.".to_string()),
-    }
-}
-
 async fn run_blocking<T, F>(task: &'static str, work: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -39,7 +22,10 @@ where
 {
     tauri::async_runtime::spawn_blocking(work)
         .await
-        .map_err(|err| format!("{task} task failed: {err}"))?
+        .map_err(|error| {
+            log::error!("{task} worker failed: {error}");
+            format!("{task} could not complete. Please try again.")
+        })?
 }
 
 #[tauri::command]
@@ -61,9 +47,8 @@ pub fn set_model_path(app: AppHandle, path: String) -> Result<(), String> {
         return Err("Path does not exist or is not a directory".to_string());
     }
 
-    let mut settings = crate::settings::get_settings(&app);
-    settings.model_path = Some(path);
-    crate::settings::save_settings(&app, &settings)
+    crate::settings::set_model_path(&app, path)
+        .map_err(|error| command_error("Could not set model path", error))
 }
 
 #[tauri::command]
@@ -73,9 +58,8 @@ pub fn get_use_streaming(app: AppHandle) -> bool {
 
 #[tauri::command]
 pub fn set_use_streaming(app: AppHandle, enabled: bool) -> Result<(), String> {
-    let mut settings = crate::settings::get_settings(&app);
-    settings.streaming_enabled = enabled;
-    crate::settings::save_settings(&app, &settings)
+    crate::settings::set_streaming_enabled(&app, enabled)
+        .map_err(|error| command_error("Could not set streaming preference", error))
 }
 
 #[tauri::command]
@@ -98,37 +82,10 @@ pub async fn set_asr_language(
 ) -> Result<(), String> {
     let engine = state.inner().clone();
     run_blocking("Speech language", move || {
-        set_asr_language_blocking(app, engine, language)
+        crate::settings::set_asr_language(&app, &engine, language)
+            .map_err(|error| command_error("Could not change speech language", error))
     })
     .await
-}
-
-fn set_asr_language_blocking(
-    app: AppHandle,
-    engine: SpeechEngine,
-    language: String,
-) -> Result<(), String> {
-    let _activity = reserve_settings_change()?;
-    engine
-        .validate_language(&language)
-        .map_err(|error| command_error("Invalid speech language", error))?;
-
-    let mut settings = crate::settings::get_settings(&app);
-    let previous = settings.asr_language.clone();
-    settings.asr_language = language.clone();
-    crate::settings::save_settings(&app, &settings).map_err(|error| {
-        log::error!("Could not persist speech language: {error}");
-        "Could not save the speech language.".to_string()
-    })?;
-
-    if let Err(error) = engine.set_language(&language) {
-        settings.asr_language = previous;
-        if let Err(rollback_error) = crate::settings::save_settings(&app, &settings) {
-            log::error!("Could not roll back speech language setting: {rollback_error}");
-        }
-        return Err(command_error("Could not apply speech language", error));
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -212,65 +169,10 @@ pub fn default_record_shortcut() -> String {
 pub async fn reset_settings(app: AppHandle, state: State<'_, SpeechEngine>) -> Result<(), String> {
     let engine = state.inner().clone();
     run_blocking("Settings reset", move || {
-        reset_settings_blocking(app, engine)
+        crate::settings::reset_settings(&app, &engine)
+            .map_err(|error| command_error("Could not reset settings", error))
     })
     .await
-}
-
-fn reset_settings_blocking(app: AppHandle, engine: SpeechEngine) -> Result<(), String> {
-    use crate::settings::{save_settings, Settings};
-
-    let _activity = reserve_settings_change()?;
-    if engine.state() == EngineState::Loading {
-        return Err(
-            "Wait for the speech model to finish loading before resetting settings.".into(),
-        );
-    }
-
-    let previous = crate::settings::get_settings(&app);
-    let settings = Settings::default();
-    if engine.is_ready() {
-        engine
-            .validate_language(&settings.asr_language)
-            .map_err(|error| command_error("Invalid default speech language", error))?;
-    }
-
-    #[cfg(desktop)]
-    let previous_shortcut = desktop::get_record_shortcut(app.clone());
-    #[cfg(desktop)]
-    desktop::update_record_shortcut(app.clone(), desktop::default_record_shortcut()).map_err(
-        |error| {
-            log::error!("Could not reset record shortcut: {error}");
-            "Could not reset the record shortcut.".to_string()
-        },
-    )?;
-
-    if let Err(error) = save_settings(&app, &settings) {
-        #[cfg(desktop)]
-        rollback_shortcut(&app, previous_shortcut.as_deref());
-        return Err(error);
-    }
-    if engine.is_ready() {
-        if let Err(error) = engine.set_language(&settings.asr_language) {
-            if let Err(rollback_error) = save_settings(&app, &previous) {
-                log::error!("Could not roll back settings reset: {rollback_error}");
-            }
-            #[cfg(desktop)]
-            rollback_shortcut(&app, previous_shortcut.as_deref());
-            return Err(command_error("Could not reset speech language", error));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(desktop)]
-fn rollback_shortcut(app: &AppHandle, previous: Option<&str>) {
-    if let Some(previous) = previous {
-        if let Err(error) = desktop::update_record_shortcut(app.clone(), previous.to_string()) {
-            log::error!("Could not roll back record shortcut: {error}");
-        }
-    }
 }
 
 #[tauri::command]

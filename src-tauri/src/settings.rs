@@ -3,9 +3,19 @@ use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+mod service;
+mod transaction;
+
+pub(crate) use service::{reset_settings, set_asr_language, set_model_path, set_streaming_enabled};
+#[doc(hidden)]
+pub use transaction::{
+    reset_settings_transaction, set_asr_language_transaction, EngineReadiness, SettingsAction,
+    SettingsTransactionBackend, TransactionFailure,
+};
+
 pub const DEFAULT_ASR_LANGUAGE: &str = "en-US";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
     pub model_path: Option<String>,
     pub streaming_enabled: bool,
@@ -13,6 +23,14 @@ pub struct Settings {
 }
 
 const STORE_PATH: &str = "settings.json";
+
+#[derive(thiserror::Error, Debug)]
+pub enum SettingsStoreError {
+    #[error("open settings store: {0}")]
+    Open(#[source] tauri_plugin_store::Error),
+    #[error("save settings store: {0}")]
+    Save(#[source] tauri_plugin_store::Error),
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -51,10 +69,8 @@ pub fn get_settings(app: &AppHandle) -> Settings {
     }
 }
 
-pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> {
-    let store = app
-        .store(STORE_PATH)
-        .map_err(|e| format!("Failed to open settings store: {e}"))?;
+pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), SettingsStoreError> {
+    let store = app.store(STORE_PATH).map_err(SettingsStoreError::Open)?;
 
     if let Some(path) = &settings.model_path {
         store.set("model_path", serde_json::json!(path));
@@ -73,7 +89,7 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String>
         settings.streaming_enabled
     );
 
-    store.save().map_err(|e| e.to_string())
+    store.save().map_err(SettingsStoreError::Save)
 }
 
 pub fn get_custom_model_path(app: &AppHandle) -> Option<PathBuf> {

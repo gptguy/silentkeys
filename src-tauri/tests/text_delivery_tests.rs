@@ -39,7 +39,7 @@ fn text_commits_only_after_typing_is_acknowledged() {
 }
 
 #[test]
-fn buffer_stays_unchanged_when_typing_fails() {
+fn buffer_stays_unchanged_when_submission_reports_failure() {
     let mut buffer = "hello".to_string();
 
     let result = deliver_for_tests(&mut buffer, "goodbye".to_string(), |_| {
