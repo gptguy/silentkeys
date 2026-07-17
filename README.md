@@ -28,7 +28,7 @@ Audio and transcription stay on-device. No telemetry.
 SilentKeys is a desktop dictation app that performs all audio capture and transcription locally on your machine, streaming text into whatever application has focus — no plugins required. The scope is deliberately narrow: local, system-wide speech-to-text and nothing else. It is designed for everyday use on Apple Silicon Macs and remains under active development.
 
 - **Target Platform**: macOS 14+ on Apple Silicon (M1/M2/M3/M4).
-- **Secondary Platforms**: The release workflow targets Intel macOS, Linux, and Windows, but those builds remain experimental until their platform acceptance gates pass. Linux builds require glibc 2.39 or newer (Ubuntu 24.04 or Debian 13).
+- **Secondary Platforms**: The release workflow targets Linux and Windows, but those builds remain experimental until their platform acceptance gates pass. Linux builds require glibc 2.39 or newer (Ubuntu 24.04 or Debian 13).
 - **Resource Footprint** (measured on an M-series Mac):
   - **App executable**: approximately 20 MB; signed updater archive approximately 9 MB
   - **Downloaded model**: approximately 683 MB
